@@ -1,7 +1,16 @@
+<p align="center">
+  <img src="logo.png" width="120" alt="TabT logo" />
+</p>
+
 # TabT
 
 A small, fast native terminal emulator for macOS, written in Rust on top of AppKit. Multi-tab
 sessions with a self-drawn sidebar for tabs and groups, and a dependency-free VT/ANSI core.
+
+<p align="center">
+  <img src="screen1.png" width="49%" alt="TabT window with sidebar groups and a terminal session" />
+  <img src="screen2.png" width="49%" alt="TabT with multiple tabs and groups in the sidebar" />
+</p>
 
 ## Features
 

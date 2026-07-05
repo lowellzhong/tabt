@@ -76,4 +76,4 @@ Notes for contributors:
 
 ## License
 
-TODO — pick a license before publishing.
+MIT — see [LICENSE](LICENSE).

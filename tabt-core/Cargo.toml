@@ -1,0 +1,7 @@
+[package]
+name = "tabt-core"
+version = "0.1.0"
+edition = "2021"
+
+# 刻意保持零依赖:这一层是纯逻辑,任何平台都能 cargo test
+[dependencies]

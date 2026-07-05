@@ -1,0 +1,63 @@
+[package]
+name = "tabt-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tabt"
+path = "src/main.rs"
+
+# 第 1 步的 PTY 回声环:独立命令行工具,不依赖 AppKit
+[[bin]]
+name = "pty-echo"
+path = "src/bin/pty_echo.rs"
+
+[dependencies]
+tabt-core = { path = "../tabt-core" }
+libc = "0.2"
+
+# objc2 系列是 Objective-C runtime 的薄绑定,编译期展开为 objc_msgSend,
+# 无运行时开销。版本刻意锁定在下面这组(API 之间有配套关系)。
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = [
+    "NSString",
+    "NSGeometry",
+    "NSThread",
+    "NSObject",
+    "NSDictionary",
+    "NSAttributedString",
+] }
+objc2-app-kit = { version = "0.2", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSAlert",
+    "NSButton",
+    "NSControl",
+    "NSWindow",
+    "NSView",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSBezierPath",
+    "NSTrackingArea",
+    "NSMenu",
+    "NSMenuItem",
+    "NSRunningApplication",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSColor",
+    "NSPopUpButton",
+    "NSStepper",
+    "NSTextField",
+    "NSCell",
+    "NSAppearance",
+    "NSEvent",
+    "NSAttributedString",
+    "NSStringDrawing",
+    "NSParagraphStyle",
+    "NSPasteboard",
+    "NSImage",
+    "NSViewController",
+    "NSTitlebarAccessoryViewController",
+    "NSLayoutConstraint",
+    "NSCursor",
+] }

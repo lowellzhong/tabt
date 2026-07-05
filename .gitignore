@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+
+# Built app bundle (produced by `make run`/`make`)
+/TabT.app/
+
+# macOS junk
+.DS_Store
+
+# Claude Code local/personal files (the shared CLAUDE.md stays tracked; ignore the rest)
+.claude/
+CLAUDE.local.md

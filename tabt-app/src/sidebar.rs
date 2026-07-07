@@ -106,6 +106,7 @@ struct Row {
     collapsed: bool, // only meaningful for group rows: collapsed state
     group: usize,    // the group this row belongs to (usize::MAX for button rows)
     dot: u8,         // tab rows: status-dot color index (0 = default/auto)
+    locked: bool,    // tab rows: whether the tab is locked (protected from close)
 }
 
 pub struct SidebarIvars {
@@ -281,6 +282,22 @@ declare_class!(
             self.start_edit(Editing::Tab(id));
         }
 
+        #[method(tabRevealInFinder:)]
+        fn tab_reveal_in_finder(&self, item: &NSMenuItem) {
+            let id = unsafe { item.tag() } as u64;
+            if let Some(ctrl) = self.controller() {
+                ctrl.reveal_in_finder_id(id);
+            }
+        }
+
+        #[method(tabToggleLock:)]
+        fn tab_toggle_lock(&self, item: &NSMenuItem) {
+            let id = unsafe { item.tag() } as u64;
+            if let Some(ctrl) = self.controller() {
+                ctrl.toggle_tab_lock(id);
+            }
+        }
+
         #[method(tabClose:)]
         fn tab_close(&self, item: &NSMenuItem) {
             let id = unsafe { item.tag() } as u64;
@@ -370,49 +387,49 @@ impl SidebarView {
         let mut rows = Vec::new();
         let mut y = TOP_INSET;
         // Search box (label holds the current query; drawn specially in render).
-        rows.push(Row { top: y, h: SEARCH_H, indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0 });
+        rows.push(Row { top: y, h: SEARCH_H, indent: PAD, label: query.to_string(), kind: Press::Search, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
         y += SEARCH_H + GAP;
 
         // Side-by-side "Terminal" and "Group" buttons, occupying one row.
-        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0 });
+        rows.push(Row { top: y, h: BTN_H, indent: PAD, label: String::new(), kind: Press::Actions, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
         y += BTN_H + GAP;
 
         // Ungrouped tabs (the "会话" session list), rendered at the top with a shallow indent.
-        let matched_ung: Vec<&(u64, String, u8)> = snap
+        let matched_ung: Vec<&(u64, String, u8, bool)> = snap
             .ungrouped
             .iter()
-            .filter(|(_, t, _)| q.is_empty() || t.to_lowercase().contains(&q))
+            .filter(|(_, t, _, _)| q.is_empty() || t.to_lowercase().contains(&q))
             .collect();
         if !matched_ung.is_empty() {
             // "Sessions" section label above the tabs (matches the GROUP labels below).
-            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0 });
+            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
             y += SECTION_H;
-            for (id, title, dot) in matched_ung {
+            for (id, title, dot, locked) in matched_ung {
                 let selected = snap.active == Some(*id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: title.clone(), kind: Press::Tab(*id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: *dot });
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: title.clone(), kind: Press::Tab(*id, UNGROUPED), selected, collapsed: false, group: UNGROUPED, dot: *dot, locked: *locked });
                 y += ROW_H;
             }
         }
 
         for (gi, g) in snap.groups.iter().enumerate() {
             // Filter: when the query is non-empty, keep only tabs whose title matches, and hide groups with no match.
-            let matched: Vec<&(u64, String, u8)> = g
+            let matched: Vec<&(u64, String, u8, bool)> = g
                 .tabs
                 .iter()
-                .filter(|(_, t, _)| q.is_empty() || t.to_lowercase().contains(&q))
+                .filter(|(_, t, _, _)| q.is_empty() || t.to_lowercase().contains(&q))
                 .collect();
             if !q.is_empty() && matched.is_empty() {
                 continue;
             }
-            rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(gi), selected: false, collapsed: g.collapsed, group: gi, dot: 0 });
+            rows.push(Row { top: y - scroll, h: ROW_H, indent: PAD, label: g.name.clone(), kind: Press::Group(gi), selected: false, collapsed: g.collapsed, group: gi, dot: 0, locked: false });
             y += ROW_H;
             // Hide tabs when collapsed and not in search state; while searching, always show matches (to make collapsed tabs findable).
             if g.collapsed && q.is_empty() {
                 continue;
             }
-            for (id, title, dot) in matched {
+            for (id, title, dot, locked) in matched {
                 let selected = snap.active == Some(*id);
-                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: title.clone(), kind: Press::Tab(*id, gi), selected, collapsed: false, group: gi, dot: *dot });
+                rows.push(Row { top: y - scroll, h: ROW_H, indent: 26.0, label: title.clone(), kind: Press::Tab(*id, gi), selected, collapsed: false, group: gi, dot: *dot, locked: *locked });
                 y += ROW_H;
             }
         }
@@ -437,6 +454,7 @@ impl SidebarView {
             collapsed: false,
             group: usize::MAX,
             dot: 0,
+            locked: false,
         }]
     }
 
@@ -603,7 +621,7 @@ impl SidebarView {
             let folder = if row.collapsed { "folder.fill" } else { "folder" };
             draw_symbol(folder, rect(row.indent, vmid(12.0), 14.0, 12.0), text_weakest());
             let label_x = row.indent + 20.0;
-            draw_truncated(&row.label.to_uppercase(), rect(label_x, vmid(13.0), (w - 34.0 - label_x).max(0.0), 15.0), &self.ivars().font_small, text_weakest());
+            draw_truncated(&row.label, rect(label_x, vmid(13.0), (w - 34.0 - label_x).max(0.0), 15.0), &self.ivars().font_small, text_weakest());
             if hovered {
                 draw_symbol("ellipsis", rect(w - 28.0, vmid(11.0), 16.0, 11.0), text_placeholder());
             }
@@ -649,14 +667,14 @@ impl SidebarView {
         // Name truncates with an ellipsis; leaves room for the right-side meta / "⋯".
         let name_x = row.indent + 30.0;
         draw_truncated(&row.label, rect(name_x, vmid(16.0), (w - 40.0 - name_x).max(0.0), 18.0), &self.ivars().font, fg);
-        // Right side: show "⋯" on hover/selected, otherwise show shell metadata.
-        if hovered || row.selected {
+        // Right side: "⋯" while hovered (so the menu — including Unlock — is reachable on any tab);
+        // otherwise a lock glyph for locked tabs, "⋯" for the selected tab, and nothing at rest.
+        if hovered {
             draw_symbol("ellipsis", rect(w - 28.0, vmid(11.0), 16.0, 11.0), text_placeholder());
-        } else {
-            let attrs = make_attrs(&self.ivars().font_small, Some(&ns_color(text_weakest())));
-            let ns = NSString::from_str("zsh");
-            let mw = unsafe { ns.sizeWithAttributes(Some(&attrs)).width };
-            unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(w - HPAD - mw, vmid(13.0)), Some(&attrs)) };
+        } else if row.locked {
+            draw_symbol("lock.fill", rect(w - 26.0, vmid(12.0), 11.0, 12.0), text_placeholder());
+        } else if row.selected {
+            draw_symbol("ellipsis", rect(w - 28.0, vmid(11.0), 16.0, 11.0), text_placeholder());
         }
     }
 
@@ -1132,14 +1150,39 @@ impl SidebarView {
         self.popup(&menu);
     }
 
-    /// Tab "more" menu: rename / close.
+    /// Whether tab `id` is currently locked (looked up from the controller's snapshot).
+    fn tab_locked(&self, id: u64) -> bool {
+        self.controller()
+            .map(|c| c.snapshot())
+            .map(|s| {
+                s.ungrouped
+                    .iter()
+                    .chain(s.groups.iter().flat_map(|g| g.tabs.iter()))
+                    .find(|(tid, _, _, _)| *tid == id)
+                    .map(|(_, _, _, locked)| *locked)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Tab "more" menu: rename / reveal / lock-unlock / close (Close is disabled while locked).
     fn open_tab_menu(&self, id: u64) {
         let mtm = MainThreadMarker::new().expect("main thread");
+        let locked = self.tab_locked(id);
         let menu = NSMenu::new(mtm);
+        // Manage item enablement ourselves so a locked tab's Close renders greyed-out (AppKit's
+        // auto-enable would re-enable it since the item has a valid target/action).
+        unsafe { menu.setAutoenablesItems(false) };
         menu.addItem(&self.menu_item("Rename", sel!(tabRename:), id as isize));
+        menu.addItem(&self.menu_item("Reveal in Finder", sel!(tabRevealInFinder:), id as isize));
         let sep = NSMenuItem::separatorItem(mtm);
         menu.addItem(&sep);
-        menu.addItem(&self.menu_item("Close", sel!(tabClose:), id as isize));
+        menu.addItem(&self.menu_item(if locked { "Unlock" } else { "Lock" }, sel!(tabToggleLock:), id as isize));
+        let close = self.menu_item("Close", sel!(tabClose:), id as isize);
+        if locked {
+            unsafe { close.setEnabled(false) };
+        }
+        menu.addItem(&close);
         self.popup(&menu);
     }
 
@@ -1156,8 +1199,8 @@ impl SidebarView {
                 s.ungrouped
                     .iter()
                     .chain(s.groups.iter().flat_map(|g| g.tabs.iter()))
-                    .find(|(tid, _, _)| *tid == id)
-                    .map(|(_, _, d)| *d)
+                    .find(|(tid, _, _, _)| *tid == id)
+                    .map(|(_, _, d, _)| *d)
                     .unwrap_or(0)
             })
             .unwrap_or(0);
@@ -1337,8 +1380,8 @@ impl SidebarView {
                 .ungrouped
                 .iter()
                 .chain(snap.groups.iter().flat_map(|g| g.tabs.iter()))
-                .find(|(tid, _, _)| *tid == id)
-                .map(|(_, t, _)| t.clone())
+                .find(|(tid, _, _, _)| *tid == id)
+                .map(|(_, t, _, _)| t.clone())
                 .unwrap_or_default(),
             Editing::Group(gi) => snap.groups.get(gi).map(|g| g.name.clone()).unwrap_or_default(),
         };

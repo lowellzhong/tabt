@@ -13,19 +13,21 @@ use std::ffi::c_void;
 use std::os::unix::io::RawFd;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontWeightRegular,
     NSForegroundColorAttributeName, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale,
     NSLineBreakMode, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard,
-    NSPasteboardTypeString, NSRectFill, NSStringDrawing, NSView,
+    NSPasteboardTypeString, NSRectFill, NSStringDrawing, NSTextInputClient, NSView,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSMutableDictionary, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSInteger,
+    NSMutableDictionary, NSObjectProtocol, NSPoint, NSRange, NSRangePointer, NSRect, NSSize,
+    NSString, NSUInteger,
 };
 
-use tabt_core::{Color, Grid, BOLD, UNDERLINE};
+use tabt_core::{char_width, Color, Grid, BOLD, UNDERLINE, WIDE_TRAILER};
 
 use crate::settings;
 use crate::theme::{self, Rgb, Theme};
@@ -34,7 +36,8 @@ use crate::theme::{self, Rgb, Theme};
 pub(crate) const PAD: f64 = 10.0;
 /// Extra vertical space added to each row on top of the natural glyph height (line spacing).
 /// Glyphs are centered within the taller row, so half the gap sits above and half below.
-const LINE_GAP: f64 = 4.0;
+/// Zero means the standard/default line height (the font's own natural glyph height).
+const LINE_GAP: f64 = 0.0;
 
 /// Callback for session end (shell exit): (context, tab id). Uses a raw pointer + function pointer
 /// rather than depending on the AppController type directly, to avoid a view ↔ app circular dependency.
@@ -56,6 +59,9 @@ pub struct TermViewIvars {
     // Mouse selection: anchor + current drag point (cell coordinates (col,row)); equal = empty selection.
     sel_anchor: Cell<Option<(usize, usize)>>,
     sel_head: Cell<Option<(usize, usize)>>,
+    // IME composition (preedit): the in-progress marked text drawn inline at the cursor.
+    // Empty when not composing. Set by setMarkedText:, cleared by insertText:/unmarkText.
+    marked_text: RefCell<String>,
 }
 
 declare_class!(
@@ -98,32 +104,53 @@ declare_class!(
         #[method(keyDown:)]
         fn key_down(&self, event: &NSEvent) {
             let fd = self.ivars().master_fd;
-            // ⌘B: collapse/expand the sidebar (keyCode 11 = 'b').
-            let cmd = unsafe { event.modifierFlags() }
-                .contains(NSEventModifierFlags::NSEventModifierFlagCommand);
-            if cmd && unsafe { event.keyCode() } == 11 {
-                if let Some(f) = self.ivars().toggle_fn.get() {
-                    f(self.ivars().close_ctx.get());
-                }
-                return;
-            }
-            // Special keys like arrow keys must send terminal escape sequences, not characters() (which gives private-use-area code points).
-            if let Some(seq) = self.special_key_seq(unsafe { event.keyCode() }) {
-                unsafe { write_all(fd, seq) };
-                return;
-            }
-            // Any other ⌘-chord reaching here has no menu item bound to it (those are intercepted
-            // by the menu system before keyDown: is ever called) and no meaning to a shell — swallow
-            // it instead of forwarding the bare character (e.g. ⌘J would otherwise send a plain 'j').
+            let flags = unsafe { event.modifierFlags() };
+            let cmd = flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand);
+            let ctrl = flags.contains(NSEventModifierFlags::NSEventModifierFlagControl);
+
+            // ⌘B: collapse/expand the sidebar (keyCode 11 = 'b'). Any other ⌘-chord reaching here
+            // has no menu item bound to it (bound ones are intercepted by the menu system before
+            // keyDown:) and no meaning to a shell — swallow it rather than forward the bare character.
             if cmd {
+                if unsafe { event.keyCode() } == 11 {
+                    if let Some(f) = self.ivars().toggle_fn.get() {
+                        f(self.ivars().close_ctx.get());
+                    }
+                }
                 return;
             }
-            if let Some(s) = unsafe { event.characters() } {
-                let bytes = s.to_string().into_bytes();
-                if !bytes.is_empty() {
-                    unsafe { write_all(fd, &bytes) };
+
+            // While an IME composition is active, every key belongs to the input system (to select a
+            // candidate, extend/cancel the composition, etc.) — route it there unconditionally below.
+            let composing = !self.ivars().marked_text.borrow().is_empty();
+
+            if !composing {
+                // Special keys (arrows, Tab/⇧Tab, Return, Delete, Esc, function keys) must send precise
+                // terminal byte sequences rather than characters() (which yields private-use code points).
+                if let Some(seq) = self.key_seq(event) {
+                    unsafe { write_all(fd, seq) };
+                    return;
+                }
+                // Control chords: handle BEFORE the input system, otherwise AppKit's emacs-style default
+                // key bindings would hijack them (Ctrl+A → move-to-line-start, etc.). macOS already folds
+                // Ctrl+letter into the control byte in characters() (Ctrl+C → 0x03, Ctrl+[ → 0x1b, …).
+                if ctrl {
+                    if let Some(s) = unsafe { event.characters() } {
+                        let bytes = s.to_string().into_bytes();
+                        if !bytes.is_empty() {
+                            unsafe { write_all(fd, &bytes) };
+                        }
+                    }
+                    return;
                 }
             }
+
+            // Plain text and IME composition flow through the macOS text input system: committed text
+            // arrives via insertText:, in-progress composition via setMarkedText:. Option/Alt intentionally
+            // falls through here (matches Terminal.app's default: dead keys / é / …), so "Option as Meta"
+            // ESC-prefixing is deliberately not emitted.
+            let array = NSArray::from_slice(&[event]);
+            unsafe { self.interpretKeyEvents(&array) };
         }
 
         // Window size change: first let the superclass update the frame, then re-lay-out the grid to the new size and notify the PTY.
@@ -197,7 +224,112 @@ declare_class!(
             unsafe { self.setNeedsDisplay(true) };
         }
     }
+
+    // The text input system drives IME composition through these callbacks. They are invoked
+    // *synchronously and re-entrantly* from inside interpretKeyEvents: (see key_down), so every
+    // method must take the shortest possible RefCell borrow — holding one across an AppKit call
+    // would abort the process (panic="abort", no unwind) on the re-entrant borrow.
+    unsafe impl NSTextInputClient for TermView {
+        // Commit text: a finished IME composition, or a plain typed character. Write it to the PTY
+        // exactly as a keystroke and clear any composition state.
+        #[method(insertText:replacementRange:)]
+        fn insert_text(&self, string: &AnyObject, _replacement: NSRange) {
+            let text = ns_input_string(string);
+            self.ivars().marked_text.borrow_mut().clear();
+            if !text.is_empty() {
+                unsafe { write_all(self.ivars().master_fd, text.as_bytes()) };
+            }
+            unsafe { self.setNeedsDisplay(true) };
+        }
+
+        // Composition in progress: stash the marked (preedit) text so render() draws it inline and
+        // hasMarkedText/markedRange report it. selected_range/replacement are unused (single-line preedit).
+        #[method(setMarkedText:selectedRange:replacementRange:)]
+        fn set_marked_text(&self, string: &AnyObject, _selected: NSRange, _replacement: NSRange) {
+            *self.ivars().marked_text.borrow_mut() = ns_input_string(string);
+            unsafe { self.setNeedsDisplay(true) };
+        }
+
+        #[method(unmarkText)]
+        fn unmark_text(&self) {
+            self.ivars().marked_text.borrow_mut().clear();
+            unsafe { self.setNeedsDisplay(true) };
+        }
+
+        #[method(hasMarkedText)]
+        fn has_marked_text(&self) -> bool {
+            !self.ivars().marked_text.borrow().is_empty()
+        }
+
+        #[method(markedRange)]
+        fn marked_range(&self) -> NSRange {
+            let n = self.ivars().marked_text.borrow().chars().count();
+            if n == 0 {
+                NSRange::new(NS_NOT_FOUND, 0)
+            } else {
+                NSRange::new(0, n)
+            }
+        }
+
+        #[method(selectedRange)]
+        fn selected_range(&self) -> NSRange {
+            // Caret at the end of the preedit; no live selection to report otherwise.
+            let n = self.ivars().marked_text.borrow().chars().count();
+            if n == 0 {
+                NSRange::new(NS_NOT_FOUND, 0)
+            } else {
+                NSRange::new(n, 0)
+            }
+        }
+
+        // We don't back the composition with a document, so there is no substring to hand back.
+        #[method_id(attributedSubstringForProposedRange:actualRange:)]
+        fn attributed_substring(
+            &self,
+            _range: NSRange,
+            _actual: NSRangePointer,
+        ) -> Option<Retained<NSAttributedString>> {
+            None
+        }
+
+        #[method_id(validAttributesForMarkedText)]
+        fn valid_attributes(&self) -> Retained<NSArray<NSAttributedStringKey>> {
+            NSArray::new()
+        }
+
+        // Where the IME should anchor its candidate window: the cursor cell, in screen coordinates.
+        #[method(firstRectForCharacterRange:actualRange:)]
+        fn first_rect(&self, range: NSRange, actual: NSRangePointer) -> NSRect {
+            if !actual.is_null() {
+                unsafe { *actual = range };
+            }
+            let (cw, lh) = (settings::cell_w(), settings::line_h());
+            let (cc, cr) = self.ivars().grid.borrow().cursor; // (usize, usize) is Copy: borrow drops here
+            let cell = rect(PAD + cc as f64 * cw, PAD + cr as f64 * lh, cw, lh);
+            match self.window() {
+                Some(win) => {
+                    let in_window = self.convertRect_toView(cell, None);
+                    win.convertRectToScreen(in_window)
+                }
+                None => cell,
+            }
+        }
+
+        #[method(characterIndexForPoint:)]
+        fn character_index_for_point(&self, _point: NSPoint) -> NSUInteger {
+            NS_NOT_FOUND
+        }
+
+        // Reached for keys the input system maps to editing commands (only while composing, since
+        // key_down handles control/special keys directly otherwise). No-op — and crucially, *not*
+        // forwarding to super suppresses AppKit's system beep for unhandled commands.
+        #[method(doCommandBySelector:)]
+        fn do_command_by_selector(&self, _selector: Sel) {}
+    }
 );
+
+/// NSNotFound (== NSIntegerMax) as an unsigned index, used to report "no range/index".
+const NS_NOT_FOUND: NSUInteger = NSInteger::MAX as NSUInteger;
 
 impl TermView {
     pub fn new(
@@ -218,6 +350,7 @@ impl TermView {
             closing: Cell::new(false),
             sel_anchor: Cell::new(None),
             sel_head: Cell::new(None),
+            marked_text: RefCell::new(String::new()),
         });
         unsafe { msg_send_id![super(this), initWithFrame: frame] }
     }
@@ -275,11 +408,14 @@ impl TermView {
         }
     }
 
-    /// Map a macOS virtual keycode to a terminal escape sequence. Returning None means it's not a special key,
-    /// handing it back to `characters()` for the normal character path. Arrow keys and Home/End are affected by DECCKM:
-    /// in application cursor keys mode send `ESC O x`, otherwise send `ESC [ x`.
-    fn special_key_seq(&self, keycode: u16) -> Option<&'static [u8]> {
-        let app = self.ivars().grid.borrow().app_cursor_keys();
+    /// Map a key event to a terminal byte sequence. Returning None means it is not a special key,
+    /// handing it to the text input system for the normal text path. Arrow keys and Home/End are
+    /// affected by DECCKM: in application cursor keys mode send `ESC O x`, otherwise `ESC [ x`.
+    fn key_seq(&self, event: &NSEvent) -> Option<&'static [u8]> {
+        let keycode = unsafe { event.keyCode() };
+        let shift = unsafe { event.modifierFlags() }
+            .contains(NSEventModifierFlags::NSEventModifierFlagShift);
+        let app = self.ivars().grid.borrow().app_cursor_keys(); // bool is Copy: borrow drops here
         let seq: &'static [u8] = match keycode {
             126 => if app { b"\x1bOA" } else { b"\x1b[A" }, // ↑
             125 => if app { b"\x1bOB" } else { b"\x1b[B" }, // ↓
@@ -290,6 +426,22 @@ impl TermView {
             116 => b"\x1b[5~",                              // PageUp
             121 => b"\x1b[6~",                              // PageDown
             117 => b"\x1b[3~",                              // Forward Delete
+            48 => if shift { b"\x1b[Z" } else { b"\t" },    // Tab / ⇧Tab (CBT back-tab)
+            36 | 76 => b"\r",                               // Return / keypad Enter
+            51 => b"\x7f",                                  // Delete (Backspace) → DEL
+            53 => b"\x1b",                                  // Escape
+            122 => b"\x1bOP",                               // F1
+            120 => b"\x1bOQ",                               // F2
+            99 => b"\x1bOR",                                // F3
+            118 => b"\x1bOS",                               // F4
+            96 => b"\x1b[15~",                              // F5
+            97 => b"\x1b[17~",                              // F6
+            98 => b"\x1b[18~",                              // F7
+            100 => b"\x1b[19~",                             // F8
+            101 => b"\x1b[20~",                             // F9
+            109 => b"\x1b[21~",                             // F10
+            103 => b"\x1b[23~",                             // F11
+            111 => b"\x1b[24~",                             // F12
             _ => return None,
         };
         Some(seq)
@@ -400,7 +552,10 @@ impl TermView {
             let c1 = if r == er { ec } else { cols - 1 };
             let mut line = String::new();
             for c in c0..=c1 {
-                line.push(grid.cell(c, r).ch);
+                let ch = grid.cell(c, r).ch;
+                if ch != '\0' {
+                    line.push(ch); // skip wide-char trailer placeholders
+                }
             }
             out.push_str(line.trim_end());
             if r != er {
@@ -456,8 +611,19 @@ impl TermView {
                     c += 1;
                 }
                 let (fg, bg, flags) = a0;
+
+                // Wide-char trailer run: the lead cell's glyph and its extended background/underline
+                // already cover this column. Skip it entirely — painting its background here would
+                // overwrite the right half of the wide glyph drawn by the lead cell.
+                if flags & WIDE_TRAILER != 0 {
+                    continue;
+                }
+
                 let run_x = PAD + start as f64 * cw;
-                let run_w = (c - start) as f64 * cw;
+                // A wide lead char is always the last cell of its run (its trailer has distinct attrs),
+                // so if the cell just past the run is a trailer, extend the fill by one column to cover it.
+                let trailing = c < cols && grid.cell(c, r).flags & WIDE_TRAILER != 0;
+                let run_w = (c - start) as f64 * cw + if trailing { cw } else { 0.0 };
 
                 // Background: only fill non-default backgrounds (the default background is already covered by the whole-window background).
                 if bg != default_bg {
@@ -467,8 +633,14 @@ impl TermView {
                     }
                 }
 
-                // Text: a run of pure whitespace need not draw glyphs.
-                let text: String = (start..c).map(|i| grid.cell(i, r).ch).collect();
+                // Text: a run of pure whitespace need not draw glyphs. Wide-char trailer cells hold
+                // '\0' (the lead cell's glyph already spans both columns) — filter them out. The run
+                // always breaks at a wide char (its trailer carries WIDE_TRAILER, a distinct attr set),
+                // so each wide glyph is drawn on its own, positioned at its exact cell origin.
+                let text: String = (start..c)
+                    .map(|i| grid.cell(i, r).ch)
+                    .filter(|&ch| ch != '\0')
+                    .collect();
                 if !text.trim().is_empty() {
                     let font = if flags & BOLD != 0 { &font_bold } else { &font };
                     let color = ns_color(fg);
@@ -496,15 +668,43 @@ impl TermView {
                 let y = PAD + cr as f64 * lh;
                 let cell = grid.cell(cc, cr);
                 let (fg, bg, _) = eff(cell, &t);
+                // A wide glyph occupies two columns; the cursor block covers both.
+                let cur_w = if char_width(cell.ch) == 2 { 2.0 * cw } else { cw };
                 unsafe {
                     ns_color(fg).set();
-                    NSRectFill(rect(x, y, cw, lh));
+                    NSRectFill(rect(x, y, cur_w, lh));
                 }
                 if cell.ch != ' ' {
                     let color = ns_color(bg);
                     let attrs = make_attrs(&font, Some(&color));
                     let ns = NSString::from_str(&cell.ch.to_string());
                     unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(x, y + LINE_GAP / 2.0), Some(&attrs)) };
+                }
+            }
+        }
+
+        // IME preedit: draw the in-progress composition inline at the cursor, underlined, on top of
+        // the grid (and the cursor block). Distinct RefCell from `grid`, so this borrow is independent.
+        let marked = ivars.marked_text.borrow();
+        if !marked.is_empty() {
+            let (cc, cr) = grid.cursor;
+            if cc < cols && cr < rows {
+                let x = PAD + cc as f64 * cw;
+                let y = PAD + cr as f64 * lh;
+                let n = marked.chars().count();
+                // Clamp the width to the row's remaining cells so it can't overflow the view.
+                let w = (n as f64 * cw).min((cols - cc) as f64 * cw);
+                unsafe {
+                    // Opaque background so the preedit stays readable over whatever was underneath.
+                    ns_color(default_bg).set();
+                    NSRectFill(rect(x, y, w, lh));
+                    let color = ns_color(t.fg);
+                    let attrs = make_attrs(&font, Some(&color));
+                    let ns = NSString::from_str(&marked);
+                    ns.drawAtPoint_withAttributes(NSPoint::new(x, y + LINE_GAP / 2.0), Some(&attrs));
+                    // Underline marks the run as composing (not yet committed) text.
+                    ns_color(t.fg).set();
+                    NSRectFill(rect(x, y + lh - 1.0, w, 1.0));
                 }
             }
         }
@@ -566,6 +766,21 @@ fn palette(n: u8, t: &Theme) -> (u8, u8, u8) {
 
 pub(crate) fn ns_color(rgb: Rgb) -> Retained<NSColor> {
     unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(rgb.0, rgb.1, rgb.2, 1.0) }
+}
+
+/// Extract the plain string from an `insertText:`/`setMarkedText:` argument, which AppKit hands over
+/// as `id` — either an `NSString` or an `NSAttributedString`.
+fn ns_input_string(string: &AnyObject) -> String {
+    unsafe {
+        let is_attributed: bool = msg_send![string, isKindOfClass: NSAttributedString::class()];
+        if is_attributed {
+            let attr: &NSAttributedString = &*(string as *const AnyObject as *const NSAttributedString);
+            attr.string().to_string()
+        } else {
+            let ns: &NSString = &*(string as *const AnyObject as *const NSString);
+            ns.to_string()
+        }
+    }
 }
 
 pub(crate) fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {

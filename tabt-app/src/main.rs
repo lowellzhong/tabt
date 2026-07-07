@@ -39,6 +39,17 @@ const CONTENT_H: f64 = 620.0;
 fn main() {
     // The child shell relies on TERM to recognize the terminal type; set it before spawning any thread, so forked children inherit it directly.
     std::env::set_var("TERM", "xterm-256color");
+    // Present TabT's own terminal identity instead of inheriting whatever launched us. When TabT is
+    // started from Apple Terminal (or a bare binary in one), the shell exports TERM_PROGRAM=Apple_Terminal
+    // plus a TERM_SESSION_ID UUID; a child zsh would then source /etc/zshrc_Apple_Terminal and use that
+    // *inherited, shared* session id to manage ~/.zsh_sessions/<uuid>.session — so every tab (and the real
+    // Terminal.app) fights over one file, printing "rm: …session: No such file or directory". Overriding
+    // TERM_PROGRAM (!= Apple_Terminal) disables that script; clearing the stale session id/version avoids
+    // leaking another program's identity to the shell. Done in the parent (not post-fork) to stay clear of
+    // async-signal-safety limits, and before AppKit starts any thread so every child inherits the clean env.
+    std::env::set_var("TERM_PROGRAM", "TabT");
+    std::env::remove_var("TERM_PROGRAM_VERSION");
+    std::env::remove_var("TERM_SESSION_ID");
 
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
     let app = NSApplication::sharedApplication(mtm);

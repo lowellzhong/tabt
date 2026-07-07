@@ -27,6 +27,8 @@ objc2-foundation = { version = "0.2", features = [
     "NSObject",
     "NSDictionary",
     "NSAttributedString",
+    "NSArray",
+    "NSRange",
 ] }
 objc2-app-kit = { version = "0.2", features = [
     "NSApplication",
@@ -61,4 +63,6 @@ objc2-app-kit = { version = "0.2", features = [
     "NSTitlebarAccessoryViewController",
     "NSLayoutConstraint",
     "NSCursor",
+    "NSTextInputClient",
+    "NSTextInputContext",
 ] }

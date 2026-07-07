@@ -30,7 +30,8 @@ use crate::view::{self, TermView};
 struct Tab {
     id: u64,
     title: String,
-    dot: u8, // status-dot color index (0 = default/auto; 1..=8 = classic colors, see sidebar::DOT_COLORS)
+    dot: u8,      // status-dot color index (0 = default/auto; 1..=8 = classic colors, see sidebar::DOT_COLORS)
+    locked: bool, // locked tabs are protected from being closed by the user (⌘W / the tab menu)
     view: Retained<TermView>,
     master_fd: RawFd,
     shell_pid: libc::pid_t, // the shell's own pid/pgid; used to detect a foreground job (pty::has_foreground_job)
@@ -56,12 +57,12 @@ struct Model {
 pub struct GroupSnap {
     pub name: String,
     pub collapsed: bool,
-    pub tabs: Vec<(u64, String, u8)>, // (id, title, dot-color index)
+    pub tabs: Vec<(u64, String, u8, bool)>, // (id, title, dot-color index, locked)
 }
 
 /// Read-only snapshot used by the sidebar for drawing (does not expose internal details like Retained).
 pub struct Snapshot {
-    pub ungrouped: Vec<(u64, String, u8)>, // ungrouped tabs (id, title, dot-color index), rendered at the top
+    pub ungrouped: Vec<(u64, String, u8, bool)>, // ungrouped tabs (id, title, dot-color index, locked), rendered at the top
     pub groups: Vec<GroupSnap>,
     pub active: Option<u64>,
     pub style: usize,
@@ -309,7 +310,7 @@ impl AppController {
         // spawn (e.g. the system is out of file descriptors) is silently skipped — restore
         // whatever we can rather than aborting the whole session restore.
         for t in layout.ungrouped {
-            let _ = self.spawn_tab(None, t.title, &t.cwd, t.dot);
+            let _ = self.spawn_tab(None, t.title, &t.cwd, t.dot, t.locked);
         }
         for (name, collapsed, tabs) in layout.groups {
             let gi = {
@@ -318,7 +319,7 @@ impl AppController {
                 m.groups.len() - 1
             };
             for t in tabs {
-                let _ = self.spawn_tab(Some(gi), t.title, &t.cwd, t.dot);
+                let _ = self.spawn_tab(Some(gi), t.title, &t.cwd, t.dot, t.locked);
             }
         }
         let first = self.model.borrow().tabs.first().map(|t| t.id);
@@ -358,7 +359,7 @@ impl AppController {
     /// (for session restore, may be empty). When `group` is None it goes into the ungrouped list. Registered into the model.
     /// Returns `None` if the PTY/process itself couldn't be spawned (e.g. out of file
     /// descriptors) — the caller must skip creating this one tab without disturbing any others.
-    fn spawn_tab(&self, group: Option<usize>, title: String, cwd: &str, dot: u8) -> Option<u64> {
+    fn spawn_tab(&self, group: Option<usize>, title: String, cwd: &str, dot: u8, locked: bool) -> Option<u64> {
         let id = {
             let mut m = self.model.borrow_mut();
             let id = m.next_id;
@@ -373,7 +374,7 @@ impl AppController {
         let reader = view::attach_reader(&v);
 
         let mut m = self.model.borrow_mut();
-        m.tabs.push(Tab { id, title, dot, view: v, master_fd: fd, shell_pid, reader, spawn_cwd: cwd.to_string() });
+        m.tabs.push(Tab { id, title, dot, locked, view: v, master_fd: fd, shell_pid, reader, spawn_cwd: cwd.to_string() });
         match group {
             Some(gi) if gi < m.groups.len() => m.groups[gi].tabs.push(id),
             _ => m.ungrouped.push(id),
@@ -452,17 +453,58 @@ impl AppController {
         }
     }
 
-    /// New tab: by default not placed in any group (rendered at the top of the list); can be dragged into a group when needed.
+    /// New tab. When a tab is selected, the new tab inherits its working directory and is inserted
+    /// immediately after it within the same group/list. With no selection, it lands in the ungrouped
+    /// list (rendered at the top) in the home directory; it can be dragged into a group when needed.
     pub fn add_tab_default(&self) {
+        // Snapshot the selected tab's cwd + group under a single borrow, before spawning.
+        let anchor = {
+            let m = self.model.borrow();
+            m.active.and_then(|a| {
+                let cwd = m.tabs.iter().find(|t| t.id == a).map(|t| {
+                    // Prefer the live OSC 7 cwd; fall back to the directory it was spawned in.
+                    let live = t.view.cwd();
+                    if live.is_empty() { t.spawn_cwd.clone() } else { live }
+                })?;
+                let group = m.groups.iter().position(|g| g.tabs.contains(&a));
+                Some((a, group, cwd))
+            })
+        };
         let n = self.model.borrow().next_id;
-        match self.spawn_tab(None, format!("Terminal {}", n), "", 0) {
+        let (group, cwd) = match &anchor {
+            Some((_, g, cwd)) => (*g, cwd.clone()),
+            None => (None, String::new()),
+        };
+        match self.spawn_tab(group, format!("Terminal {}", n), &cwd, 0, false) {
             Some(id) => {
+                if let Some((active_id, _, _)) = anchor {
+                    self.place_tab_after(group, id, active_id);
+                }
                 self.select(id);
                 self.save();
                 self.refresh_sidebar();
             }
             None => self.alert_spawn_failed(),
         }
+    }
+
+    /// Move `id` to sit immediately after `anchor` within `group`'s ordered list (both must already be
+    /// in that same list — `spawn_tab` appended `id` to its end). Keeps a new tab next to its origin.
+    fn place_tab_after(&self, group: Option<usize>, id: u64, anchor: u64) {
+        let mut m = self.model.borrow_mut();
+        let list: &mut Vec<u64> = match group {
+            Some(gi) if gi < m.groups.len() => &mut m.groups[gi].tabs,
+            _ => &mut m.ungrouped,
+        };
+        if let Some(p) = list.iter().position(|&t| t == id) {
+            list.remove(p);
+        }
+        let pos = list
+            .iter()
+            .position(|&t| t == anchor)
+            .map(|p| p + 1)
+            .unwrap_or(list.len());
+        list.insert(pos, id);
     }
 
     /// Shown when a new tab's PTY/process couldn't be created (e.g. out of file descriptors).
@@ -626,8 +668,9 @@ impl AppController {
         true
     }
 
-    /// The tab adjacent to `id` in visual order (ungrouped first, followed by each group): prefer the next one,
-    /// otherwise the previous one. Used to move focus to a neighbor rather than the oldest tab after closing the active tab.
+    /// The tab adjacent to `id` in visual order (ungrouped first, followed by each group): prefer the
+    /// preceding one, falling back to the next when closing the very first tab. Used to move focus to a
+    /// neighbor after closing the active tab.
     fn adjacent_tab(&self, id: u64) -> Option<u64> {
         let m = self.model.borrow();
         let mut order: Vec<u64> = m.ungrouped.clone();
@@ -635,10 +678,9 @@ impl AppController {
             order.extend(g.tabs.iter().copied());
         }
         let pos = order.iter().position(|&t| t == id)?;
-        order
-            .get(pos + 1)
-            .copied()
-            .or_else(|| pos.checked_sub(1).and_then(|p| order.get(p).copied()))
+        pos.checked_sub(1)
+            .and_then(|p| order.get(p).copied())
+            .or_else(|| order.get(pos + 1).copied())
     }
 
     /// Close a tab because its shell process exited on its own. If it was the last tab, the app
@@ -652,6 +694,11 @@ impl AppController {
     /// If the shell has a foreground job (not just an idle prompt), confirm first — closing tears
     /// down the PTY, which kills that job with no chance to save work.
     pub fn close_tab_user(&self, id: u64) {
+        // A locked tab is protected from user-initiated close: silently ignore. The user must
+        // unlock it first (via the tab menu). The shell exiting on its own still closes it.
+        if self.is_tab_locked(id) {
+            return;
+        }
         if self.tab_has_foreground_job(id) && !confirm(self.mtm, "Close this tab?", RUNNING_JOB_WARNING, "Close") {
             return;
         }
@@ -736,6 +783,25 @@ impl AppController {
         self.update_title(); // when collapsed, the renamed tab may be the active one
     }
 
+    /// Toggle a tab's locked state. A locked tab is protected from user-initiated close (⌘W / the
+    /// tab menu's Close); the shell exiting on its own still closes it (see `close_tab`).
+    pub fn toggle_tab_lock(&self, id: u64) {
+        {
+            let mut m = self.model.borrow_mut();
+            match m.tabs.iter_mut().find(|t| t.id == id) {
+                Some(t) => t.locked = !t.locked,
+                None => return,
+            }
+        }
+        self.save();
+        self.refresh_sidebar();
+    }
+
+    /// Whether the given tab is locked (protected from user-initiated close).
+    fn is_tab_locked(&self, id: u64) -> bool {
+        self.model.borrow().tabs.iter().find(|t| t.id == id).map(|t| t.locked).unwrap_or(false)
+    }
+
     /// Set a tab's status-dot color (index into sidebar::DOT_COLORS; 0 = default/auto).
     pub fn set_tab_dot(&self, id: u64, dot: u8) {
         {
@@ -764,7 +830,7 @@ impl AppController {
 
     pub fn snapshot(&self) -> Snapshot {
         let m = self.model.borrow();
-        let title_of = |id: &u64| m.tabs.iter().find(|t| t.id == *id).map(|t| (t.id, t.title.clone(), t.dot));
+        let title_of = |id: &u64| m.tabs.iter().find(|t| t.id == *id).map(|t| (t.id, t.title.clone(), t.dot, t.locked));
         let ungrouped = m.ungrouped.iter().filter_map(title_of).collect();
         let groups = m
             .groups
@@ -892,12 +958,21 @@ impl AppController {
         }
     }
 
-    /// Open the active tab's current directory in Finder (reported via OSC 7; falls back to the spawn-time directory when missing).
+    /// Open the active tab's current directory in Finder.
     pub fn reveal_in_finder(&self) {
+        if let Some(a) = self.model.borrow().active {
+            self.reveal_in_finder_id(a);
+        }
+    }
+
+    /// Open a specific tab's current directory in Finder (reported via OSC 7; falls back to the
+    /// spawn-time directory when missing). Used by the per-tab context menu.
+    pub fn reveal_in_finder_id(&self, id: u64) {
         let cwd = {
             let m = self.model.borrow();
-            m.active
-                .and_then(|a| m.tabs.iter().find(|t| t.id == a))
+            m.tabs
+                .iter()
+                .find(|t| t.id == id)
                 .map(|t| {
                     let live = t.view.cwd();
                     if live.is_empty() { t.spawn_cwd.clone() } else { live }
@@ -934,17 +1009,17 @@ impl AppController {
     /// Persist the layout + session state (cwd + each tab's currently visible content).
     fn save(&self) {
         let m = self.model.borrow();
-        // A single tab id -> (title, cwd).
+        // A single tab id -> (title, cwd, dot, locked).
         let tab_state = |id: &u64| {
             m.tabs.iter().find(|t| t.id == *id).map(|t| {
                 // cwd prefers the live OSC 7 report; falls back to the spawn-time directory when missing.
                 let live = t.view.cwd();
                 let cwd = if live.is_empty() { t.spawn_cwd.clone() } else { live };
-                (t.title.clone(), cwd, t.dot)
+                (t.title.clone(), cwd, t.dot, t.locked)
             })
         };
-        let ungrouped: Vec<(String, String, u8)> = m.ungrouped.iter().filter_map(tab_state).collect();
-        let groups: Vec<(String, bool, Vec<(String, String, u8)>)> = m
+        let ungrouped: Vec<(String, String, u8, bool)> = m.ungrouped.iter().filter_map(tab_state).collect();
+        let groups: Vec<(String, bool, Vec<(String, String, u8, bool)>)> = m
             .groups
             .iter()
             .map(|g| {

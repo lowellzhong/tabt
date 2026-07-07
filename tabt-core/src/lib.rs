@@ -42,6 +42,49 @@ pub const BOLD: u8 = 1 << 0;
 pub const ITALIC: u8 = 1 << 1;
 pub const UNDERLINE: u8 = 1 << 2;
 pub const INVERSE: u8 = 1 << 3;
+/// Trailing (right) half of a double-width character (e.g. CJK). The left cell holds the glyph;
+/// this cell is a placeholder so the grid column count matches the display width. Its `ch` is `'\0'`
+/// and renderers/`to_lines()` skip it. Set on the second cell of every wide glyph.
+pub const WIDE_TRAILER: u8 = 1 << 4;
+
+/// Display width of a character in terminal cells: 0 (combining/zero-width), 1 (normal), or 2
+/// (East Asian wide / fullwidth). A dependency-free approximation of Unicode East Asian Width —
+/// covers the CJK/Kana/Hangul/fullwidth blocks that matter in practice, not the full UAX #11 table.
+pub fn char_width(ch: char) -> usize {
+    let c = ch as u32;
+    // Zero-width: combining marks and the common zero-width spaces/joiners.
+    if matches!(c,
+        0x0300..=0x036F | // combining diacritical marks
+        0x200B..=0x200F | // zero-width space/joiner/marks
+        0xFE00..=0xFE0F | // variation selectors
+        0xFEFF            // zero-width no-break space (BOM)
+    ) {
+        return 0;
+    }
+    // Double-width: East Asian wide and fullwidth ranges.
+    let wide = matches!(c,
+        0x1100..=0x115F | // Hangul Jamo
+        0x2E80..=0x303E | // CJK radicals, Kangxi, CJK symbols & punctuation
+        0x3041..=0x33FF | // Hiragana, Katakana, Bopomofo, Hangul Compat Jamo, enclosed CJK, …
+        0x3400..=0x4DBF | // CJK Unified Ideographs Extension A
+        0x4E00..=0x9FFF | // CJK Unified Ideographs
+        0xA000..=0xA4CF | // Yi Syllables/Radicals
+        0xA960..=0xA97F | // Hangul Jamo Extended-A
+        0xAC00..=0xD7A3 | // Hangul Syllables
+        0xF900..=0xFAFF | // CJK Compatibility Ideographs
+        0xFE10..=0xFE19 | // vertical forms
+        0xFE30..=0xFE6F | // CJK compatibility forms, small form variants
+        0xFF00..=0xFF60 | // fullwidth forms
+        0xFFE0..=0xFFE6 | // fullwidth signs
+        0x1F300..=0x1FAFF | // emoji & pictographs (mostly wide)
+        0x20000..=0x3FFFD   // CJK Unified Ideographs Extension B and beyond
+    );
+    if wide {
+        2
+    } else {
+        1
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
@@ -275,25 +318,47 @@ impl Grid {
     }
 
     fn print(&mut self, ch: char) {
+        let w = char_width(ch);
+        if w == 0 {
+            // Zero-width (combining marks, etc.): the minimal core does not compose them onto the
+            // previous cell — drop them rather than let them consume a column.
+            return;
+        }
         if self.pending_wrap {
             self.cursor.0 = 0;
             self.linefeed();
             self.pending_wrap = false;
         }
+        // A double-width glyph can't straddle the right margin: if only one column is left, wrap to
+        // the next line first so the pair stays together (matches how the shell lays out CJK).
+        if w == 2 && self.cursor.0 + 1 >= self.cols && self.autowrap {
+            self.cursor.0 = 0;
+            self.linefeed();
+        }
         let (c, r) = self.cursor;
         let (fg, bg, fl) = (self.pen_fg, self.pen_bg, self.pen_flags);
-        let cell = self.cell_mut(c, r);
-        cell.ch = ch;
-        cell.fg = fg;
-        cell.bg = bg;
-        cell.flags = fl;
-        if c + 1 >= self.cols {
+        {
+            let cell = self.cell_mut(c, r);
+            cell.ch = ch;
+            cell.fg = fg;
+            cell.bg = bg;
+            cell.flags = fl;
+        }
+        // Second half of a wide glyph: a placeholder cell the renderer/to_lines() skip.
+        if w == 2 && c + 1 < self.cols {
+            let cell = self.cell_mut(c + 1, r);
+            cell.ch = '\0';
+            cell.fg = fg;
+            cell.bg = bg;
+            cell.flags = fl | WIDE_TRAILER;
+        }
+        if c + w >= self.cols {
             // Stay in the last column; only set the deferred-wrap bit if autowrap is on.
             if self.autowrap {
                 self.pending_wrap = true;
             }
         } else {
-            self.cursor.0 += 1;
+            self.cursor.0 = c + w;
         }
     }
 
@@ -989,6 +1054,7 @@ impl Grid {
             .map(|r| {
                 (0..self.cols)
                     .map(|c| self.cell(c, r).ch)
+                    .filter(|&ch| ch != '\0') // drop wide-char trailer placeholders
                     .collect::<String>()
                     .trim_end()
                     .to_string()
@@ -1230,6 +1296,31 @@ mod tests {
         assert_eq!(g.cell(0, 0).ch, 'h');
         assert_eq!(g.cell(1, 0).ch, 'é');
         assert_eq!(g.cell(2, 0).ch, 'λ');
+    }
+
+    #[test]
+    fn wide_chars_occupy_two_cells() {
+        // Each CJK glyph takes two columns: the lead cell holds the char, the next is a '\0' trailer
+        // flagged WIDE_TRAILER. The cursor advances by 2, keeping the grid in sync with the shell.
+        let mut g = Grid::new(10, 1);
+        g.feed("你a".as_bytes());
+        assert_eq!(g.cell(0, 0).ch, '你');
+        assert_eq!(g.cell(1, 0).ch, '\0');
+        assert_ne!(g.cell(1, 0).flags & WIDE_TRAILER, 0);
+        assert_eq!(g.cell(2, 0).ch, 'a'); // 'a' lands after the 2-cell wide char, not at col 1
+        assert_eq!(g.cursor, (3, 0));
+        assert_eq!(g.to_lines()[0], "你a"); // trailer placeholder is not exported
+    }
+
+    #[test]
+    fn wide_char_wraps_at_right_margin() {
+        // Two columns wide, only one left: the pair must not straddle the margin — it wraps whole.
+        let mut g = Grid::new(3, 2);
+        g.feed("ab你".as_bytes()); // 'a','b' fill cols 0,1; one col left → 你 wraps to row 1
+        assert_eq!(g.cell(0, 0).ch, 'a');
+        assert_eq!(g.cell(1, 0).ch, 'b');
+        assert_eq!(g.cell(0, 1).ch, '你');
+        assert_eq!(g.cell(1, 1).ch, '\0');
     }
 
     #[test]

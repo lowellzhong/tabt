@@ -42,11 +42,12 @@ use std::path::PathBuf;
 /// Highest valid status-dot color index (must match sidebar::DOT_COLORS: indices 0..=8).
 const MAX_DOT: u8 = 8;
 
-/// Persistent state of one tab (title + last working directory + status-dot color index).
+/// Persistent state of one tab (title + last working directory + status-dot color index + lock).
 pub struct TabState {
     pub title: String,
     pub cwd: String,
-    pub dot: u8, // 0 = default/auto; 1..=8 = classic colors (see sidebar::DOT_COLORS)
+    pub dot: u8,      // 0 = default/auto; 1..=8 = classic colors (see sidebar::DOT_COLORS)
+    pub locked: bool, // locked tabs are protected from being closed (⌘W / the tab menu's Close)
 }
 
 /// The layout read back: color theme name + font + sidebar width/position + ungrouped tabs + each group.
@@ -159,7 +160,7 @@ pub fn load() -> Layout {
                 _ => {}
             },
             Section::Tabs => match key {
-                "tab" => ungrouped.push(TabState { title: value.to_string(), cwd: String::new(), dot: 0 }),
+                "tab" => ungrouped.push(TabState { title: value.to_string(), cwd: String::new(), dot: 0, locked: false }),
                 "cwd" => {
                     if let Some(t) = ungrouped.last_mut() {
                         t.cwd = value.to_string();
@@ -170,6 +171,11 @@ pub fn load() -> Layout {
                         t.dot = if n <= MAX_DOT { n } else { 0 }; // ignore out-of-range indices
                     }
                 }
+                "lock" => {
+                    if let Some(t) = ungrouped.last_mut() {
+                        t.locked = value.eq_ignore_ascii_case("true") || value == "1";
+                    }
+                }
                 _ => {}
             },
             Section::Group => {
@@ -177,8 +183,8 @@ pub fn load() -> Layout {
                     match key {
                         "name" => g.0 = value.to_string(),
                         "collapsed" => g.1 = value.eq_ignore_ascii_case("true") || value == "1",
-                        "tab" => g.2.push(TabState { title: value.to_string(), cwd: String::new(), dot: 0 }),
-                        // cwd / dot belong to the nearest tab in this section.
+                        "tab" => g.2.push(TabState { title: value.to_string(), cwd: String::new(), dot: 0, locked: false }),
+                        // cwd / dot / lock belong to the nearest tab in this section.
                         "cwd" => {
                             if let Some(t) = g.2.last_mut() {
                                 t.cwd = value.to_string();
@@ -187,6 +193,11 @@ pub fn load() -> Layout {
                         "dot" => {
                             if let (Some(t), Ok(n)) = (g.2.last_mut(), value.parse::<u8>()) {
                                 t.dot = if n <= MAX_DOT { n } else { 0 }; // ignore out-of-range indices
+                            }
+                        }
+                        "lock" => {
+                            if let Some(t) = g.2.last_mut() {
+                                t.locked = value.eq_ignore_ascii_case("true") || value == "1";
                             }
                         }
                         _ => {}
@@ -200,13 +211,13 @@ pub fn load() -> Layout {
     // When entirely empty (no ungrouped tabs and no tabs inside groups), add one ungrouped tab so a terminal is available.
     let total_tabs = ungrouped.len() + groups.iter().map(|g| g.2.len()).sum::<usize>();
     if total_tabs == 0 {
-        ungrouped.push(TabState { title: "Terminal 1".to_string(), cwd: String::new(), dot: 0 });
+        ungrouped.push(TabState { title: "Terminal 1".to_string(), cwd: String::new(), dot: 0, locked: false });
     }
 
     Layout { style, font_family, font_size, sidebar_w, sidebar_right, show_border, window_w, window_h, ungrouped, groups }
 }
 
-/// Write the layout back. Tabs in `ungrouped`/`groups` are (title, cwd, dot).
+/// Write the layout back. Tabs in `ungrouped`/`groups` are (title, cwd, dot, locked).
 pub fn save(
     style: &str,
     font_family: &str,
@@ -216,20 +227,23 @@ pub fn save(
     show_border: bool,
     window_w: f64,
     window_h: f64,
-    ungrouped: &[(String, String, u8)],
-    groups: &[(String, bool, Vec<(String, String, u8)>)],
+    ungrouped: &[(String, String, u8, bool)],
+    groups: &[(String, bool, Vec<(String, String, u8, bool)>)],
 ) {
     let _ = fs::create_dir_all(dir());
 
-    // For each tab, write one tab= line and optional cwd=/dot= lines.
-    let write_tabs = |s: &mut String, tabs: &[(String, String, u8)]| {
-        for (title, cwd, dot) in tabs {
+    // For each tab, write one tab= line and optional cwd=/dot=/lock= lines.
+    let write_tabs = |s: &mut String, tabs: &[(String, String, u8, bool)]| {
+        for (title, cwd, dot, locked) in tabs {
             s.push_str(&format!("tab = {}\n", title));
             if !cwd.is_empty() {
                 s.push_str(&format!("cwd = {}\n", cwd));
             }
             if *dot != 0 {
                 s.push_str(&format!("dot = {}\n", dot));
+            }
+            if *locked {
+                s.push_str("lock = true\n");
             }
         }
     };

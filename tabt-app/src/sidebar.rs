@@ -4,6 +4,7 @@
 //!   - two buttons at the top: "＋ New Terminal" and "＋ New Group";
 //!   - each group has one title row, with its tabs listed indented below; click a tab to switch,
 //!     drag a tab to another group to move it.
+//!
 //! All actions are forwarded to [`AppController`](crate::app::AppController). The view is never
 //! the first responder (acceptsFirstResponder defaults to false); keyboard focus always stays on the terminal.
 
@@ -68,13 +69,13 @@ fn overlay(alpha: f64) -> Retained<NSColor> {
 /// dot-color menu and the per-tab `dot` index persisted in the layout file.
 pub const DOT_COLORS: [(&str, (f64, f64, f64)); 9] = [
     ("Default", (0.0, 0.0, 0.0)), // sentinel: never drawn directly (see draw_row)
-    ("Red", (255.0 / 255.0, 69.0 / 255.0, 58.0 / 255.0)),
-    ("Orange", (255.0 / 255.0, 159.0 / 255.0, 10.0 / 255.0)),
-    ("Yellow", (255.0 / 255.0, 214.0 / 255.0, 10.0 / 255.0)),
+    ("Red", (1.0, 69.0 / 255.0, 58.0 / 255.0)),
+    ("Orange", (1.0, 159.0 / 255.0, 10.0 / 255.0)),
+    ("Yellow", (1.0, 214.0 / 255.0, 10.0 / 255.0)),
     ("Green", (50.0 / 255.0, 215.0 / 255.0, 75.0 / 255.0)),
-    ("Blue", (10.0 / 255.0, 132.0 / 255.0, 255.0 / 255.0)),
+    ("Blue", (10.0 / 255.0, 132.0 / 255.0, 1.0)),
     ("Purple", (191.0 / 255.0, 90.0 / 255.0, 242.0 / 255.0)),
-    ("Pink", (255.0 / 255.0, 55.0 / 255.0, 95.0 / 255.0)),
+    ("Pink", (1.0, 55.0 / 255.0, 95.0 / 255.0)),
     ("Gray", (152.0 / 255.0, 152.0 / 255.0, 157.0 / 255.0)),
 ];
 
@@ -92,6 +93,10 @@ enum Press {
     TabMenu(u64),     // "⋯" at the right of a tab row; click to pop up the tab menu
     TabDot(u64),      // the status dot at the left of a tab row; click to pick its color
     TabsLabel,        // "Sessions" section header above the ungrouped tabs (non-interactive)
+    NotesLabel,
+    NoteOpen(usize),
+    NoteRecent(usize),
+    NoteSubLabel,
     StyleMenu,        // bottom style row; click to pop up the color scheme menu
 }
 
@@ -433,7 +438,54 @@ impl SidebarView {
                 y += ROW_H;
             }
         }
+
+        let matched_open: Vec<(usize, &crate::app::NoteSnap)> = snap
+            .open_notes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| q.is_empty() || n.title.to_lowercase().contains(&q))
+            .collect();
+        let matched_recent: Vec<(usize, &crate::app::NoteSnap)> = snap
+            .recent_notes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| q.is_empty() || n.title.to_lowercase().contains(&q))
+            .collect();
+        if !matched_open.is_empty() || !matched_recent.is_empty() || q.is_empty() {
+            rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Note".to_string(), kind: Press::NotesLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
+            y += SECTION_H;
+            if !matched_open.is_empty() || q.is_empty() {
+                rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD + 10.0, label: "Open".to_string(), kind: Press::NoteSubLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
+                y += SECTION_H;
+                for (idx, note) in matched_open {
+                    let selected = snap.active_note.as_deref() == Some(note.path.as_str());
+                    rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: note.title.clone(), kind: Press::NoteOpen(idx), selected, collapsed: false, group: usize::MAX, dot: 0, locked: false });
+                    y += ROW_H;
+                }
+            }
+            if !matched_recent.is_empty() || q.is_empty() {
+                rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD + 10.0, label: "Recent".to_string(), kind: Press::NoteSubLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
+                y += SECTION_H;
+                for (_, note) in matched_recent {
+                    rows.push(Row { top: y - scroll, h: ROW_H, indent: 16.0, label: note.title.clone(), kind: Press::NoteRecent(note.index), selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
+                    y += ROW_H;
+                }
+            }
+        }
         rows
+    }
+
+    fn is_list_row(kind: Press) -> bool {
+        matches!(
+            kind,
+            Press::Group(_)
+                | Press::Tab(..)
+                | Press::TabsLabel
+                | Press::NotesLabel
+                | Press::NoteSubLabel
+                | Press::NoteOpen(_)
+                | Press::NoteRecent(_)
+        )
     }
 
     /// Height of the bottom settings area (settings row + symmetric top/bottom margins).
@@ -481,7 +533,7 @@ impl SidebarView {
     fn max_scroll_of(rows: &[Row], height: f64) -> f64 {
         let content_bottom = rows
             .iter()
-            .filter(|r| matches!(r.kind, Press::Group(_) | Press::Tab(..)))
+            .filter(|r| Self::is_list_row(r.kind))
             .map(|r| r.top + r.h)
             .fold(Self::list_top(), f64::max);
         let footer_top = height - Self::footer_height();
@@ -511,7 +563,7 @@ impl SidebarView {
         self.ivars().scroll.set(scroll);
         if scroll > 0.0 {
             for r in &mut rows {
-                if matches!(r.kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel) {
+                if Self::is_list_row(r.kind) {
                     r.top -= scroll;
                 }
             }
@@ -544,12 +596,12 @@ impl SidebarView {
 
         // The fixed area (search box + two buttons + bottom style row) doesn't scroll; draw directly.
         for row in &rows {
-            if !matches!(row.kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel) {
+            if !Self::is_list_row(row.kind) {
                 self.draw_row(row, w, &query, searching, editing, hovered(row));
             }
         }
 
-        // The list area (groups/tabs) is clipped to [list_top, footer_top) and drawn scrolled.
+        // The list area (sessions and notes) is clipped to [list_top, footer_top) and drawn scrolled.
         let list_rect = rect(0.0, list_top, w, (footer_top - list_top).max(0.0));
         let ctx = unsafe { NSGraphicsContext::currentContext() };
         if let Some(c) = &ctx {
@@ -557,7 +609,7 @@ impl SidebarView {
         }
         unsafe { NSRectClip(list_rect) };
         for row in &rows {
-            if matches!(row.kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel) {
+            if Self::is_list_row(row.kind) {
                 self.draw_row(row, w, &query, searching, editing, hovered(row));
             }
         }
@@ -607,8 +659,14 @@ impl SidebarView {
         let inset = rect(HPAD, row.top + 1.0, w - 2.0 * HPAD, row.h - 2.0);
         let vmid = |ih: f64| row.top + (row.h - ih) / 2.0; // vertically center icon/text
 
-        // ---- "Sessions" session-list label (mirrors the GROUP labels, no folder icon) ----
-        if let Press::TabsLabel = row.kind {
+        // ---- Top-level list labels (mirrors the GROUP labels, no folder icon) ----
+        if matches!(row.kind, Press::TabsLabel | Press::NotesLabel) {
+            draw_truncated(&row.label.to_uppercase(), rect(row.indent, vmid(13.0), (w - 2.0 * PAD).max(0.0), 15.0), &self.ivars().font_small, text_weakest());
+            return;
+        }
+
+        // ---- Note sublabels ("Open" / "Recent") ----
+        if let Press::NoteSubLabel = row.kind {
             draw_truncated(&row.label.to_uppercase(), rect(row.indent, vmid(13.0), (w - 2.0 * PAD).max(0.0), 15.0), &self.ivars().font_small, text_weakest());
             return;
         }
@@ -640,6 +698,21 @@ impl SidebarView {
             let ns = NSString::from_str("Settings");
             unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(HPAD + ip + 22.0, vmid(16.0)), Some(&attrs)) };
             self.draw_badge("⌘,", w - HPAD - ip, row.top + row.h / 2.0);
+            return;
+        }
+
+        // ---- Note row ----
+        if matches!(row.kind, Press::NoteOpen(_) | Press::NoteRecent(_)) {
+            if row.selected {
+                round_fill(inset, 7.0, &overlay(0.16));
+                round_stroke(inset, 7.0, 1.0, &overlay(0.24));
+            } else if hovered {
+                round_fill(inset, 7.0, &overlay(0.06));
+            }
+            let fg = if row.selected { text_primary() } else { text_secondary() };
+            draw_symbol("doc.text", rect(row.indent + 2.0, vmid(14.0), 13.0, 14.0), fg);
+            let name_x = row.indent + 22.0;
+            draw_truncated(&row.label, rect(name_x, vmid(16.0), (w - 28.0 - name_x).max(0.0), 18.0), &self.ivars().font, fg);
             return;
         }
 
@@ -849,7 +922,7 @@ impl SidebarView {
     fn row_at(&self, snap: &Snapshot, y: f64, h: f64, query: &str) -> Press {
         let footer_top = h - Self::footer_height();
         for row in &Self::all_rows(snap, h, query, self.scroll()) {
-            let list_row = matches!(row.kind, Press::Group(_) | Press::Tab(..) | Press::TabsLabel);
+            let list_row = Self::is_list_row(row.kind);
             if list_row && (y < Self::list_top() || y >= footer_top) {
                 continue;
             }
@@ -999,6 +1072,14 @@ impl SidebarView {
                     } else {
                         ctrl.select(id);
                     }
+                }
+                Press::NoteOpen(idx) => {
+                    self.exit_search();
+                    ctrl.select_open_note(idx);
+                }
+                Press::NoteRecent(idx) => {
+                    self.exit_search();
+                    ctrl.select_recent_note(idx);
                 }
                 Press::Group(gi) => {
                     // Single-click a group title → collapse/expand (rename etc. go through the "⋯" menu).
@@ -1358,13 +1439,25 @@ impl SidebarView {
         };
         let snap = ctrl.snapshot();
         let query = self.ivars().query.borrow().clone();
-        let first = Self::build_rows(&snap, &query, self.scroll()).into_iter().find_map(|r| match r.kind {
-            Press::Tab(id, _) => Some(id),
-            _ => None,
-        });
-        if let Some(id) = first {
-            self.exit_search();
-            ctrl.select(id);
+        for row in Self::build_rows(&snap, &query, self.scroll()) {
+            match row.kind {
+                Press::Tab(id, _) => {
+                    self.exit_search();
+                    ctrl.select(id);
+                    return;
+                }
+                Press::NoteOpen(idx) => {
+                    self.exit_search();
+                    ctrl.select_open_note(idx);
+                    return;
+                }
+                Press::NoteRecent(idx) => {
+                    self.exit_search();
+                    ctrl.select_recent_note(idx);
+                    return;
+                }
+                _ => {}
+            }
         }
     }
 

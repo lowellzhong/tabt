@@ -95,7 +95,7 @@ unsafe fn real_main() -> ! {
             libc::cfmakeraw(&mut raw);
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
 
-            libc::signal(libc::SIGWINCH, on_sigwinch as libc::sighandler_t);
+            libc::signal(libc::SIGWINCH, on_sigwinch as *const () as libc::sighandler_t);
 
             let mut buf = [0u8; 8192];
             let mut fds = [

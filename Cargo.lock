@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "tabt-app"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "libc",
  "objc2",
@@ -135,4 +135,4 @@ dependencies = [
 
 [[package]]
 name = "tabt-core"
-version = "0.1.0"
+version = "0.1.2"

@@ -2,22 +2,29 @@
 //!
 //! Owns all sessions (each tab = one PTY + one [`TermView`]); responsible for creating / switching /
 //! moving / closing tabs, mounting the current active tab's view into the right-hand host container,
-//! and persisting the group layout to ~/.tabt. It is a plain Rust struct (held in an `Rc`, exclusive to
+//! and persisting the group layout to ~/Documents/TabT/AppData. It is a plain Rust struct (held in an `Rc`, exclusive to
 //! the main thread); the sidebar and TermView call back into it via a raw pointer -- as long as it is
 //! alive (main holds the `Rc` until app.run ends), the pointer stays valid.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
+use std::io::Read;
 use std::os::unix::io::RawFd;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use objc2::rc::Retained;
-use objc2_app_kit::{NSAlert, NSApplication, NSAutoresizingMaskOptions, NSView, NSWindow, NSWindowButton};
+use objc2_app_kit::{
+    NSAlert, NSApplication, NSAutoresizingMaskOptions, NSView, NSWindow, NSWindowButton,
+};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 use crate::config;
 use crate::divider::{Divider, DIVIDER_W};
 use crate::header::{HeaderView, HEADER_H};
+use crate::note::{NoteButton, NoteEditor, NoteSearchPanel, NOTE_W};
 use crate::placeholder::PlaceholderView;
 use crate::pty;
 use crate::settings;
@@ -45,11 +52,30 @@ struct Group {
     tabs: Vec<u64>,  // ordered tab ids
 }
 
+struct NoteDoc {
+    path: PathBuf,
+    editor: NoteEditor,
+}
+
+struct NoteSearchDoc {
+    snap: NoteSnap,
+    haystack: String,
+}
+
+struct NoteIndexResult {
+    controller: usize,
+    generation: u64,
+    docs: Vec<NoteSearchDoc>,
+}
+
 struct Model {
     ungrouped: Vec<u64>, // ids of tabs not belonging to any group (ordered, rendered at the top of the list)
     groups: Vec<Group>,
     tabs: Vec<Tab>,
     active: Option<u64>,
+    active_note: Option<PathBuf>,
+    open_notes: Vec<NoteDoc>,
+    recent_notes: Vec<PathBuf>,
     next_id: u64,
 }
 
@@ -60,11 +86,21 @@ pub struct GroupSnap {
     pub tabs: Vec<(u64, String, u8, bool)>, // (id, title, dot-color index, locked)
 }
 
+#[derive(Clone)]
+pub struct NoteSnap {
+    pub title: String,
+    pub path: String,
+    pub index: usize,
+}
+
 /// Read-only snapshot used by the sidebar for drawing (does not expose internal details like Retained).
 pub struct Snapshot {
     pub ungrouped: Vec<(u64, String, u8, bool)>, // ungrouped tabs (id, title, dot-color index, locked), rendered at the top
     pub groups: Vec<GroupSnap>,
     pub active: Option<u64>,
+    pub active_note: Option<String>,
+    pub open_notes: Vec<NoteSnap>,
+    pub recent_notes: Vec<NoteSnap>,
     pub style: usize,
 }
 
@@ -76,7 +112,13 @@ pub struct AppController {
     toggle_btn: Retained<ToggleButton>,
     divider: Retained<Divider>,
     header: Retained<HeaderView>, // terminal-pane header bar (top of host)
+    note_btn: Retained<NoteButton>, // notes pop-up button in the terminal header
     placeholder: Retained<PlaceholderView>, // empty-state view shown when there are no sessions
+    note_search: RefCell<Option<Retained<NoteSearchPanel>>>, // live note-search panel, built lazily
+    note_index: RefCell<Vec<NoteSearchDoc>>, // prebuilt note-search haystacks; keeps typing instant
+    note_index_ready: Cell<bool>,
+    note_index_loading: Cell<bool>,
+    note_index_generation: Cell<u64>,
     style: Cell<usize>,        // index of the current color theme (theme::NAMES)
     collapsed: Cell<bool>,     // whether the sidebar is collapsed/hidden
     sidebar_w: Cell<f64>,      // current sidebar width (draggable)
@@ -106,6 +148,19 @@ impl AppController {
             );
             host.addSubview(&header);
         }
+        let note_btn = NoteButton::new(
+            mtm,
+            NSRect::new(
+                NSPoint::new(hb.size.width - NOTE_W - 14.0, hb.size.height - HEADER_H + (HEADER_H - NOTE_W) / 2.0),
+                NSSize::new(NOTE_W, NOTE_W),
+            ),
+        );
+        unsafe {
+            note_btn.setAutoresizingMask(
+                NSAutoresizingMaskOptions::NSViewMinXMargin | NSAutoresizingMaskOptions::NSViewMinYMargin,
+            );
+            host.addSubview(&note_btn);
+        }
         // Empty-state placeholder occupying the terminal area (below the header); mounted only when there are no sessions.
         let placeholder = PlaceholderView::new(
             mtm,
@@ -117,14 +172,29 @@ impl AppController {
             );
         }
         let c = Rc::new(AppController {
-            model: RefCell::new(Model { ungrouped: Vec::new(), groups: Vec::new(), tabs: Vec::new(), active: None, next_id: 1 }),
+            model: RefCell::new(Model {
+                ungrouped: Vec::new(),
+                groups: Vec::new(),
+                tabs: Vec::new(),
+                active: None,
+                active_note: None,
+                open_notes: Vec::new(),
+                recent_notes: load_recent_notes(),
+                next_id: 1,
+            }),
             window,
             sidebar,
             host,
             toggle_btn,
             divider,
             header,
+            note_btn,
             placeholder,
+            note_search: RefCell::new(None),
+            note_index: RefCell::new(Vec::new()),
+            note_index_ready: Cell::new(false),
+            note_index_loading: Cell::new(false),
+            note_index_generation: Cell::new(0),
             style: Cell::new(0),
             collapsed: Cell::new(false),
             sidebar_w: Cell::new(SIDEBAR_W),
@@ -136,6 +206,7 @@ impl AppController {
         c.sidebar.set_controller(Rc::as_ptr(&c));
         c.toggle_btn.set_controller(Rc::as_ptr(&c));
         c.divider.set_controller(Rc::as_ptr(&c));
+        c.note_btn.set_controller(Rc::as_ptr(&c));
         c
     }
 
@@ -276,16 +347,22 @@ impl AppController {
     /// The title bar always shows the current active tab's name; falls back to "TabT" when there is no active tab.
     fn update_title(&self) {
         let m = self.model.borrow();
-        let title = m
-            .active
-            .and_then(|a| m.tabs.iter().find(|t| t.id == a))
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| "TabT".to_string());
+        let title = if let Some(path) = &m.active_note {
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Note")
+                .to_string()
+        } else {
+            m.active
+                .and_then(|a| m.tabs.iter().find(|t| t.id == a))
+                .map(|t| t.title.clone())
+                .unwrap_or_else(|| "TabT".to_string())
+        };
         self.window.setTitle(&NSString::from_str(&title));
         self.header.set_title(&title);
     }
 
-    /// Load the layout from ~/.tabt and spawn a new shell for each tab.
+    /// Load the layout from ~/Documents/TabT/AppData and spawn a new shell for each tab.
     pub fn bootstrap(&self) {
         let layout = config::load();
         // Apply the color theme + font (both must be set before spawning tabs and computing cols/rows).
@@ -329,7 +406,7 @@ impl AppController {
             // launch) — show the empty-state placeholder instead of a blank host view.
             None => self.show_placeholder(),
         }
-        self.save(); // persist once, ensuring ~/.tabt exists and reflects the current layout
+        self.save(); // persist once, ensuring ~/Documents/TabT/AppData exists and reflects the current layout
         self.refresh_sidebar();
     }
 
@@ -383,12 +460,14 @@ impl AppController {
     }
 
     pub fn select(&self, id: u64) {
+        self.save_active_note();
         {
             let mut m = self.model.borrow_mut();
             if !m.tabs.iter().any(|t| t.id == id) {
                 return;
             }
             m.active = Some(id);
+            m.active_note = None;
         }
         self.layout_active();
         self.refresh_sidebar();
@@ -412,6 +491,9 @@ impl AppController {
         for t in &m.tabs {
             unsafe { t.view.removeFromSuperview() };
         }
+        for n in &m.open_notes {
+            unsafe { n.editor.view().removeFromSuperview() };
+        }
         if let Some(tab) = m.tabs.iter().find(|t| t.id == active) {
             unsafe {
                 tab.view.setFrame(bounds); // triggers setFrameSize -> grid reflow + TIOCSWINSZ
@@ -431,8 +513,49 @@ impl AppController {
         self.defer_reposition_traffic_lights();
     }
 
+    fn layout_active_note(&self) {
+        let m = self.model.borrow();
+        let Some(path) = m.active_note.as_ref() else {
+            return;
+        };
+        let hb = self.host.bounds();
+        let bounds = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(hb.size.width, (hb.size.height - HEADER_H).max(0.0)),
+        );
+        unsafe { self.placeholder.removeFromSuperview() };
+        for t in &m.tabs {
+            unsafe { t.view.removeFromSuperview() };
+        }
+        for n in &m.open_notes {
+            unsafe { n.editor.view().removeFromSuperview() };
+        }
+        if let Some(note) = m.open_notes.iter().find(|n| &n.path == path) {
+            unsafe {
+                note.editor.view().setFrame(bounds);
+                note.editor.view().setAutoresizingMask(
+                    NSAutoresizingMaskOptions::NSViewWidthSizable
+                        | NSAutoresizingMaskOptions::NSViewHeightSizable,
+                );
+                self.host.addSubview(note.editor.view());
+                note.editor.view().setNeedsDisplay(true);
+            }
+            note.editor.focus();
+        }
+        drop(m);
+        self.defer_reposition_traffic_lights();
+    }
+
     /// Mount the empty-state placeholder in the terminal area (no sessions left).
     fn show_placeholder(&self) {
+        let m = self.model.borrow();
+        for t in &m.tabs {
+            unsafe { t.view.removeFromSuperview() };
+        }
+        for n in &m.open_notes {
+            unsafe { n.editor.view().removeFromSuperview() };
+        }
+        drop(m);
         let hb = self.host.bounds();
         let frame = NSRect::new(
             NSPoint::new(0.0, 0.0),
@@ -750,6 +873,25 @@ impl AppController {
         }
         // Last tab closed.
         if self.model.borrow().tabs.is_empty() {
+            let has_note = {
+                let mut m = self.model.borrow_mut();
+                if m.active_note.is_none() {
+                    m.active_note = m.open_notes.first().map(|n| n.path.clone());
+                }
+                if m.active_note.is_some() {
+                    m.active = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if has_note {
+                self.layout_active_note();
+                self.save();
+                self.refresh_sidebar();
+                self.update_title();
+                return;
+            }
             if quit_if_empty {
                 unsafe { NSApplication::sharedApplication(self.mtm).terminate(None) };
                 return;
@@ -840,7 +982,28 @@ impl AppController {
                 GroupSnap { name: g.name.clone(), collapsed: g.collapsed, tabs }
             })
             .collect();
-        Snapshot { ungrouped, groups, active: m.active, style: self.style.get() }
+        let open_notes = m
+            .open_notes
+            .iter()
+            .enumerate()
+            .map(|(idx, n)| note_snap(&n.path, idx))
+            .collect();
+        let recent_notes = m
+            .recent_notes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !m.open_notes.iter().any(|n| &n.path == *p))
+            .map(|(idx, p)| note_snap(p, idx))
+            .collect();
+        Snapshot {
+            ungrouped,
+            groups,
+            active: m.active,
+            active_note: m.active_note.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            open_notes,
+            recent_notes,
+            style: self.style.get(),
+        }
     }
 
     /// Switch the global color theme: immediately redraw the current terminal and sidebar, and persist.
@@ -917,7 +1080,11 @@ impl AppController {
     /// Hand keyboard focus back to the current active terminal (used when exiting sidebar search).
     pub fn focus_terminal(&self) {
         let m = self.model.borrow();
-        if let Some(a) = m.active {
+        if let Some(path) = &m.active_note {
+            if let Some(note) = m.open_notes.iter().find(|n| &n.path == path) {
+                note.editor.focus();
+            }
+        } else if let Some(a) = m.active {
             if let Some(tab) = m.tabs.iter().find(|t| t.id == a) {
                 self.window.makeFirstResponder(Some(&tab.view));
             }
@@ -948,13 +1115,226 @@ impl AppController {
         d.as_ref().unwrap().show(self.mtm);
     }
 
+    /// Header notes button: create a new local note and open it in TextEdit.
+    pub fn new_note(&self) {
+        match create_note_file() {
+            Ok(path) => self.open_note_path(path),
+            Err(e) => self.show_note_error("Couldn’t create a new note", &e.to_string()),
+        }
+    }
+
+    /// Header notes button: open the live local-note search panel.
+    pub fn search_notes(&self) {
+        self.save_active_note();
+        self.ensure_note_search_index();
+        if self.note_search.borrow().is_none() {
+            let panel = NoteSearchPanel::new(self.mtm);
+            panel.set_controller(self as *const AppController);
+            *self.note_search.borrow_mut() = Some(panel);
+        }
+        if let Some(panel) = self.note_search.borrow().as_ref() {
+            panel.show(self.mtm);
+        }
+    }
+
+    /// Header notes button: open the folder where TabT creates new notes.
+    pub fn open_notes_folder(&self) {
+        let dir = notes_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.show_note_error("Couldn’t create the notes folder", &e.to_string());
+            return;
+        }
+        if let Err(e) = Command::new("open").arg(&dir).spawn() {
+            self.show_note_error("Couldn’t open the notes folder", &e.to_string());
+        }
+    }
+
+    pub fn select_open_note(&self, index: usize) {
+        let path = self.model.borrow().open_notes.get(index).map(|n| n.path.clone());
+        if let Some(path) = path {
+            self.open_note_path(path);
+        }
+    }
+
+    pub fn select_recent_note(&self, index: usize) {
+        let path = self.model.borrow().recent_notes.get(index).cloned();
+        if let Some(path) = path {
+            self.open_note_path(path);
+        }
+    }
+
+    pub fn open_note_path(&self, path: PathBuf) {
+        if !is_editable_note_path(&path) {
+            self.show_note_error("This note type can’t be edited in TabT yet", "Use a plain text, Markdown, or .note file.");
+            return;
+        }
+        self.save_active_note();
+        let path = path.canonicalize().unwrap_or(path);
+        let hb = self.host.bounds();
+        let frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(hb.size.width, (hb.size.height - HEADER_H).max(0.0)),
+        );
+        {
+            let mut m = self.model.borrow_mut();
+            if !m.open_notes.iter().any(|n| n.path == path) {
+                let editor = match NoteEditor::new(self.mtm, frame, path.clone()) {
+                    Ok(editor) => editor,
+                    Err(e) => {
+                        drop(m);
+                        self.show_note_error("Couldn’t open this note", &e.to_string());
+                        return;
+                    }
+                };
+                m.open_notes.push(NoteDoc {
+                    editor,
+                    path: path.clone(),
+                });
+            }
+            m.active = None;
+            m.active_note = Some(path.clone());
+            remember_note_path(&mut m.recent_notes, path);
+            save_recent_notes(&m.recent_notes);
+        }
+        self.invalidate_note_index();
+        self.layout_active_note();
+        self.refresh_sidebar();
+        self.update_title();
+    }
+
+    pub fn ensure_note_search_index(&self) {
+        if self.note_index_ready.get() || self.note_index_loading.get() {
+            return;
+        }
+        self.note_index_loading.set(true);
+        let generation = self.note_index_generation.get();
+        let controller = self as *const AppController as usize;
+        let mut paths = Vec::new();
+        {
+            let m = self.model.borrow();
+            for note in &m.open_notes {
+                push_note_path(&mut paths, note.path.clone(), 300, false);
+            }
+            for path in &m.recent_notes {
+                push_note_path(&mut paths, path.clone(), 300, false);
+            }
+        }
+        std::thread::spawn(move || {
+            collect_note_files(&notes_dir(), &mut paths, 300);
+            collect_spotlight_note_files(&mut paths, 300);
+            let docs = paths.into_iter().filter_map(note_index_doc).collect();
+            let result = Box::new(NoteIndexResult { controller, generation, docs });
+            let q: view::dispatch::Queue = unsafe { &view::dispatch::_dispatch_main_q as *const _ as *mut _ };
+            unsafe {
+                view::dispatch::dispatch_async_f(q, Box::into_raw(result) as *mut c_void, note_index_trampoline);
+            }
+        });
+    }
+
+    pub fn note_search_results(&self, query: &str) -> Vec<NoteSnap> {
+        if !self.note_index_ready.get() {
+            self.ensure_note_search_index();
+        }
+        let query = query.trim().to_lowercase();
+        self.note_index
+            .borrow()
+            .iter()
+            .filter(|doc| query.is_empty() || doc.haystack.contains(&query))
+            .take(30)
+            .map(|doc| doc.snap.clone())
+            .collect()
+    }
+
+    fn invalidate_note_index(&self) {
+        self.note_index_generation.set(self.note_index_generation.get().wrapping_add(1));
+        self.note_index_ready.set(false);
+        self.note_index_loading.set(false);
+        self.note_index.borrow_mut().clear();
+    }
+
+    pub fn note_search_loading(&self) -> bool {
+        self.note_index_loading.get()
+    }
+
+    fn save_active_note(&self) {
+        let result = {
+            let m = self.model.borrow();
+            let Some(path) = m.active_note.as_ref() else {
+                return;
+            };
+            m.open_notes
+                .iter()
+                .find(|n| &n.path == path)
+                .map(|note| (path.clone(), note.editor.save()))
+        };
+        let Some((path, result)) = result else {
+            return;
+        };
+        match result {
+            Ok(()) => self.invalidate_note_index(),
+            Err(e) => self.show_note_error(
+                "Couldn’t save this note",
+                &format!("{}\n\n{}", path.to_string_lossy(), e),
+            ),
+        }
+    }
+
+    fn show_note_error(&self, title: &str, info: &str) {
+        let alert = unsafe { NSAlert::new(self.mtm) };
+        unsafe {
+            alert.setMessageText(&NSString::from_str(title));
+            alert.setInformativeText(&NSString::from_str(info));
+            alert.runModal();
+        }
+    }
+
     /// ⌘W: close the active tab but keep the app running even if it was the last one.
     /// Only when there are no tabs at all does ⌘W quit the app.
     pub fn close_active_tab(&self) {
+        if self.model.borrow().active_note.is_some() {
+            self.close_active_note();
+            return;
+        }
         let a = self.model.borrow().active;
         match a {
             Some(a) => self.close_tab_user(a),
             None => unsafe { NSApplication::sharedApplication(self.mtm).terminate(None) },
+        }
+    }
+
+    fn close_active_note(&self) {
+        self.save_active_note();
+        let (next_note, next_tab) = {
+            let mut m = self.model.borrow_mut();
+            let Some(path) = m.active_note.take() else {
+                return;
+            };
+            if let Some(idx) = m.open_notes.iter().position(|n| n.path == path) {
+                let removed = m.open_notes.remove(idx);
+                unsafe { removed.editor.view().removeFromSuperview() };
+            }
+            let next_note = m.open_notes.first().map(|n| n.path.clone());
+            if let Some(path) = &next_note {
+                m.active = None;
+                m.active_note = Some(path.clone());
+            }
+            let next_tab = if next_note.is_none() {
+                m.tabs.first().map(|t| t.id)
+            } else {
+                None
+            };
+            (next_note, next_tab)
+        };
+        if next_note.is_some() {
+            self.layout_active_note();
+            self.refresh_sidebar();
+            self.update_title();
+        } else if let Some(id) = next_tab {
+            self.select(id);
+        } else {
+            self.show_placeholder();
+            self.refresh_sidebar();
+            self.update_title();
         }
     }
 
@@ -1003,6 +1383,7 @@ impl AppController {
 
     /// Persist once on app exit (save a snapshot of each tab's current content). See the app delegate in main.
     pub fn persist(&self) {
+        self.save_active_note();
         self.save();
     }
 
@@ -1018,8 +1399,8 @@ impl AppController {
                 (t.title.clone(), cwd, t.dot, t.locked)
             })
         };
-        let ungrouped: Vec<(String, String, u8, bool)> = m.ungrouped.iter().filter_map(tab_state).collect();
-        let groups: Vec<(String, bool, Vec<(String, String, u8, bool)>)> = m
+        let ungrouped: Vec<config::SavedTab> = m.ungrouped.iter().filter_map(tab_state).collect();
+        let groups: Vec<config::SavedGroup> = m
             .groups
             .iter()
             .map(|g| {
@@ -1028,18 +1409,215 @@ impl AppController {
             })
             .collect();
         drop(m);
-        config::save(
-            theme::NAMES[self.style.get()],
-            &settings::family(),
-            settings::size(),
-            self.sidebar_w.get(),
-            self.sidebar_right.get(),
-            settings::show_border(),
-            self.window_size().0,
-            self.window_size().1,
-            &ungrouped,
-            &groups,
-        );
+        let (window_w, window_h) = self.window_size();
+        config::save(config::SaveLayout {
+            style: theme::NAMES[self.style.get()],
+            font_family: &settings::family(),
+            font_size: settings::size(),
+            sidebar_w: self.sidebar_w.get(),
+            sidebar_right: self.sidebar_right.get(),
+            show_border: settings::show_border(),
+            window_w,
+            window_h,
+            ungrouped: &ungrouped,
+            groups: &groups,
+        });
+    }
+}
+
+fn notes_dir() -> PathBuf {
+    let mut p = app_dir();
+    p.push("Notes");
+    p
+}
+
+fn app_dir() -> PathBuf {
+    let mut p = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
+    p.push("Documents");
+    p.push("TabT");
+    p
+}
+
+fn app_data_dir() -> PathBuf {
+    let mut p = app_dir();
+    p.push("AppData");
+    p
+}
+
+fn create_note_file() -> std::io::Result<PathBuf> {
+    let dir = notes_dir();
+    std::fs::create_dir_all(&dir)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = dir.join(format!("Note-{}.txt", stamp));
+    std::fs::write(&path, "Untitled Note\n\n")?;
+    Ok(path)
+}
+
+fn collect_note_files(dir: &Path, out: &mut Vec<PathBuf>, limit: usize) {
+    if out.len() >= limit {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        if out.len() >= limit {
+            return;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_note_files(&path, out, limit);
+        } else {
+            push_note_path(out, path, limit, false);
+        }
+    }
+}
+
+fn collect_spotlight_note_files(out: &mut Vec<PathBuf>, limit: usize) {
+    if out.len() >= limit {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let query = [
+        "kMDItemFSName == '*.txt'cd",
+        "kMDItemFSName == '*.text'cd",
+        "kMDItemFSName == '*.md'cd",
+        "kMDItemFSName == '*.markdown'cd",
+        "kMDItemFSName == '*.org'cd",
+        "kMDItemFSName == '*.note'cd",
+    ]
+    .join(" || ");
+    let Ok(result) = Command::new("mdfind")
+        .arg("-onlyin")
+        .arg(home)
+        .arg(query)
+        .output()
+    else {
+        return;
+    };
+    for line in String::from_utf8_lossy(&result.stdout).lines() {
+        push_note_path(out, PathBuf::from(line), limit, true);
+        if out.len() >= limit {
+            break;
+        }
+    }
+}
+
+fn push_note_path(out: &mut Vec<PathBuf>, path: PathBuf, limit: usize, require_noteish: bool) {
+    if out.len() >= limit || !path.exists() || !is_editable_note_path(&path) {
+        return;
+    }
+    if require_noteish && !is_noteish_external_path(&path) {
+        return;
+    }
+    let path = path.canonicalize().unwrap_or(path);
+    if !out.iter().any(|p| p == &path) {
+        out.push(path);
+    }
+}
+
+fn is_noteish_external_path(path: &Path) -> bool {
+    let haystack = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .join("/")
+        .to_lowercase();
+    ["note", "notes", "memo", "journal", "diary", "notebook", "obsidian", "笔记", "记事", "备忘", "日记"]
+        .iter()
+        .any(|needle| haystack.contains(needle))
+}
+
+fn note_index_doc(path: PathBuf) -> Option<NoteSearchDoc> {
+    if !path.exists() || !is_editable_note_path(&path) {
+        return None;
+    }
+    let snap = note_snap(&path, 0);
+    let mut haystack = format!("{}\n{}", snap.title, snap.path).to_lowercase();
+    if let Ok(file) = std::fs::File::open(&path) {
+        let mut bytes = Vec::new();
+        let mut limited = file.take(32 * 1024);
+        let _ = limited.read_to_end(&mut bytes);
+        haystack.push('\n');
+        haystack.push_str(&String::from_utf8_lossy(&bytes).to_lowercase());
+    }
+    Some(NoteSearchDoc { snap, haystack })
+}
+
+fn recent_notes_file() -> PathBuf {
+    let mut p = app_data_dir();
+    p.push("notes.conf");
+    p
+}
+
+fn legacy_recent_notes_file() -> PathBuf {
+    let mut p = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
+    p.push(".tabt");
+    p.push("notes.conf");
+    p
+}
+
+fn load_recent_notes() -> Vec<PathBuf> {
+    let from_new = std::fs::read_to_string(recent_notes_file());
+    let used_legacy = from_new.is_err();
+    let notes = from_new
+        .or_else(|_| std::fs::read_to_string(legacy_recent_notes_file()))
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.exists() && is_editable_note_path(p))
+        .take(20)
+        .collect::<Vec<_>>();
+    if used_legacy && !notes.is_empty() {
+        save_recent_notes(&notes);
+    }
+    notes
+}
+
+fn save_recent_notes(notes: &[PathBuf]) {
+    if let Some(parent) = recent_notes_file().parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = notes
+        .iter()
+        .map(|p| p.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = std::fs::write(recent_notes_file(), body);
+}
+
+fn remember_note_path(recent: &mut Vec<PathBuf>, path: PathBuf) {
+    recent.retain(|p| p != &path);
+    recent.insert(0, path);
+    recent.truncate(20);
+}
+
+fn is_editable_note_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("txt" | "text" | "md" | "markdown" | "org" | "note")
+    )
+}
+
+fn note_snap(path: &Path, index: usize) -> NoteSnap {
+    NoteSnap {
+        title: path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("(untitled)")
+            .to_string(),
+        path: path.to_string_lossy().into_owned(),
+        index,
     }
 }
 
@@ -1075,4 +1653,18 @@ fn toggle_cb(ctx: *const c_void) {
 extern "C" fn reposition_trampoline(p: *mut c_void) {
     let ctrl = unsafe { &*(p as *const AppController) };
     ctrl.reposition_traffic_lights();
+}
+
+extern "C" fn note_index_trampoline(p: *mut c_void) {
+    let result = unsafe { Box::from_raw(p as *mut NoteIndexResult) };
+    let ctrl = unsafe { &*(result.controller as *const AppController) };
+    if ctrl.note_index_generation.get() != result.generation {
+        return;
+    }
+    *ctrl.note_index.borrow_mut() = result.docs;
+    ctrl.note_index_ready.set(true);
+    ctrl.note_index_loading.set(false);
+    if let Some(panel) = ctrl.note_search.borrow().as_ref() {
+        panel.refresh_results();
+    }
 }

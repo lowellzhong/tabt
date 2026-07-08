@@ -2,7 +2,7 @@
 //!
 //! The left of the window is a custom-drawn sidebar (groups + tabs, see `sidebar.rs`), the right is the terminal container host.
 //! [`AppController`](app::AppController) manages multiple sessions: one PTY + one
-//! `TermView` per tab, the active tab's view is mounted into the host. Group layout is persisted in ~/.tabt (see `config.rs`).
+//! `TermView` per tab, the active tab's view is mounted into the host. Group layout is persisted in ~/Documents/TabT/AppData (see `config.rs`).
 //!
 //! Note: must be run as a .app bundle (see the Makefile's `make run`).
 
@@ -13,6 +13,7 @@ mod config;
 mod divider;
 mod header;
 mod menu;
+mod note;
 mod placeholder;
 mod pty;
 mod settings;
@@ -55,7 +56,7 @@ fn main() {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
 
-    // ---- Font settings (default Menlo; bootstrap overrides it from ~/.tabt) ----
+    // ---- Font settings (default Menlo; bootstrap overrides it from ~/Documents/TabT/AppData) ----
     settings::set(settings::DEFAULT_FAMILY, settings::DEFAULT_SIZE);
 
     // ---- Window ----

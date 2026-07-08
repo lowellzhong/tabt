@@ -19,7 +19,7 @@ pub const FAMILIES: [&str; 10] = [
     "Lucida Console", "Inconsolata", "Source Code Pro",
 ];
 
-/// Default font family, used before ~/.tabt is loaded (matches the config load default).
+/// Default font family, used before ~/Documents/TabT/AppData is loaded (matches the config load default).
 pub const DEFAULT_FAMILY: &str = "Menlo";
 
 /// Default font size, restored by ⌘0 (matches the config load default).

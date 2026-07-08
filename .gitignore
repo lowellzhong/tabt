@@ -4,6 +4,9 @@
 # Built app bundle (produced by `make run`/`make`)
 /TabT.app/
 
+# Local app/runtime data
+/AppData/
+
 # macOS junk
 .DS_Store
 

@@ -1,6 +1,6 @@
 [package]
 name = "tabt-app"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 
@@ -50,7 +50,10 @@ objc2-app-kit = { version = "0.2", features = [
     "NSColor",
     "NSPopUpButton",
     "NSStepper",
+    "NSScrollView",
+    "NSText",
     "NSTextField",
+    "NSTextView",
     "NSCell",
     "NSAppearance",
     "NSEvent",

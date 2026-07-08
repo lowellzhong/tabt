@@ -1,4 +1,4 @@
-//! Persistence for the sidebar layout (~/.tabt/layout.conf).
+//! Persistence for the sidebar layout (~/Documents/TabT/AppData/layout.conf).
 //!
 //! Stores "structure + light state": colors/font + sidebar width/position + group name/collapsed state + each tab's
 //! title and last working directory (cwd). On next launch a new shell is spawned directly in the restored cwd.
@@ -50,6 +50,22 @@ pub struct TabState {
     pub locked: bool, // locked tabs are protected from being closed (⌘W / the tab menu's Close)
 }
 
+pub type SavedTab = (String, String, u8, bool);
+pub type SavedGroup = (String, bool, Vec<SavedTab>);
+
+pub struct SaveLayout<'a> {
+    pub style: &'a str,
+    pub font_family: &'a str,
+    pub font_size: f64,
+    pub sidebar_w: f64,
+    pub sidebar_right: bool,
+    pub show_border: bool,
+    pub window_w: f64,
+    pub window_h: f64,
+    pub ungrouped: &'a [SavedTab],
+    pub groups: &'a [SavedGroup],
+}
+
 /// The layout read back: color theme name + font + sidebar width/position + ungrouped tabs + each group.
 pub struct Layout {
     pub style: String,
@@ -66,12 +82,26 @@ pub struct Layout {
 
 fn dir() -> PathBuf {
     let mut p = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    p.push("Documents");
+    p.push("TabT");
+    p.push("AppData");
+    p
+}
+
+fn legacy_dir() -> PathBuf {
+    let mut p = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     p.push(".tabt");
     p
 }
 
 fn file() -> PathBuf {
     let mut p = dir();
+    p.push("layout.conf");
+    p
+}
+
+fn legacy_file() -> PathBuf {
+    let mut p = legacy_dir();
     p.push("layout.conf");
     p
 }
@@ -86,7 +116,9 @@ enum Section {
 
 /// Load the layout; if the file is missing or empty, provide a default group + a single tab.
 pub fn load() -> Layout {
-    let text = fs::read_to_string(file()).unwrap_or_default();
+    let text = fs::read_to_string(file())
+        .or_else(|_| fs::read_to_string(legacy_file()))
+        .unwrap_or_default();
     let mut style = "Default".to_string();
     let mut font_family = crate::settings::DEFAULT_FAMILY.to_string();
     let mut font_size = crate::settings::DEFAULT_SIZE;
@@ -218,22 +250,11 @@ pub fn load() -> Layout {
 }
 
 /// Write the layout back. Tabs in `ungrouped`/`groups` are (title, cwd, dot, locked).
-pub fn save(
-    style: &str,
-    font_family: &str,
-    font_size: f64,
-    sidebar_w: f64,
-    sidebar_right: bool,
-    show_border: bool,
-    window_w: f64,
-    window_h: f64,
-    ungrouped: &[(String, String, u8, bool)],
-    groups: &[(String, bool, Vec<(String, String, u8, bool)>)],
-) {
+pub fn save(layout: SaveLayout<'_>) {
     let _ = fs::create_dir_all(dir());
 
     // For each tab, write one tab= line and optional cwd=/dot=/lock= lines.
-    let write_tabs = |s: &mut String, tabs: &[(String, String, u8, bool)]| {
+    let write_tabs = |s: &mut String, tabs: &[SavedTab]| {
         for (title, cwd, dot, locked) in tabs {
             s.push_str(&format!("tab = {}\n", title));
             if !cwd.is_empty() {
@@ -250,21 +271,21 @@ pub fn save(
 
     let mut s = String::new();
     s.push_str("[settings]\n");
-    s.push_str(&format!("style = {}\n", style));
-    s.push_str(&format!("font_family = {}\n", font_family));
-    s.push_str(&format!("font_size = {}\n", font_size));
-    s.push_str(&format!("sidebar_width = {}\n", sidebar_w));
-    s.push_str(&format!("sidebar_right = {}\n", sidebar_right));
-    s.push_str(&format!("show_border = {}\n", show_border));
-    if window_w > 0.0 && window_h > 0.0 {
-        s.push_str(&format!("window_width = {}\n", window_w));
-        s.push_str(&format!("window_height = {}\n", window_h));
+    s.push_str(&format!("style = {}\n", layout.style));
+    s.push_str(&format!("font_family = {}\n", layout.font_family));
+    s.push_str(&format!("font_size = {}\n", layout.font_size));
+    s.push_str(&format!("sidebar_width = {}\n", layout.sidebar_w));
+    s.push_str(&format!("sidebar_right = {}\n", layout.sidebar_right));
+    s.push_str(&format!("show_border = {}\n", layout.show_border));
+    if layout.window_w > 0.0 && layout.window_h > 0.0 {
+        s.push_str(&format!("window_width = {}\n", layout.window_w));
+        s.push_str(&format!("window_height = {}\n", layout.window_h));
     }
-    if !ungrouped.is_empty() {
+    if !layout.ungrouped.is_empty() {
         s.push_str("\n[tabs]\n");
-        write_tabs(&mut s, ungrouped);
+        write_tabs(&mut s, layout.ungrouped);
     }
-    for (name, collapsed, tabs) in groups {
+    for (name, collapsed, tabs) in layout.groups {
         s.push_str("\n[group]\n");
         s.push_str(&format!("name = {}\n", name));
         s.push_str(&format!("collapsed = {}\n", collapsed));

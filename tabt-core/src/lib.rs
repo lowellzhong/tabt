@@ -19,8 +19,7 @@
 //!     `take_replies()` for the caller to write back to the PTY;
 //!   - UTF-8 multibyte character decoding.
 //!
-//! Still not implemented (left for later milestones): a scrollback buffer (once content scrolls
-//! off the top it's gone for the session) and custom tab stops.
+//! Still not implemented (left for later milestones): custom tab stops.
 
 /// A single screen cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +45,7 @@ pub const INVERSE: u8 = 1 << 3;
 /// this cell is a placeholder so the grid column count matches the display width. Its `ch` is `'\0'`
 /// and renderers/`to_lines()` skip it. Set on the second cell of every wide glyph.
 pub const WIDE_TRAILER: u8 = 1 << 4;
+const SCROLLBACK_LIMIT: usize = 10_000;
 
 /// Display width of a character in terminal cells: 0 (combining/zero-width), 1 (normal), or 2
 /// (East Asian wide / fullwidth). A dependency-free approximation of Unicode East Asian Width —
@@ -112,6 +112,7 @@ pub struct Grid {
     pub cols: usize,
     pub rows: usize,
     cells: Vec<Cell>,
+    scrollback: Vec<Vec<Cell>>,
     pub cursor: (usize, usize), // (col, row)
     // Deferred wrap: after filling the last column the cursor stays put and this
     // bit is set; the actual wrap is deferred until the next printable character
@@ -175,6 +176,7 @@ impl Grid {
             cols,
             rows,
             cells: vec![Cell::default(); cols * rows],
+            scrollback: Vec::new(),
             cursor: (0, 0),
             pending_wrap: false,
             pen_fg: Color::Default,
@@ -210,6 +212,29 @@ impl Grid {
 
     pub fn cell_mut(&mut self, col: usize, row: usize) -> &mut Cell {
         &mut self.cells[row * self.cols + col]
+    }
+
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    pub fn max_scrollback_offset(&self) -> usize {
+        if self.alt {
+            0
+        } else {
+            self.scrollback.len()
+        }
+    }
+
+    pub fn visible_cell(&self, col: usize, row: usize, scroll_offset: usize) -> &Cell {
+        let scroll_offset = scroll_offset.min(self.max_scrollback_offset());
+        let history_rows = self.scrollback.len();
+        let global_row = history_rows + row - scroll_offset;
+        if global_row < history_rows {
+            &self.scrollback[global_row][col]
+        } else {
+            self.cell(col, global_row - history_rows)
+        }
     }
 
     /// Whether the cursor is shown (DECTCEM), for the rendering layer's reference.
@@ -378,7 +403,7 @@ impl Grid {
                 let next = (self.cursor.0 / 8 + 1) * 8;
                 self.cursor.0 = next.min(self.cols - 1);
             }
-            0x0a | 0x0b | 0x0c => self.linefeed(), // LF / VT / FF
+            0x0a..=0x0c => self.linefeed(), // LF / VT / FF
             0x0d => {
                 // CR
                 self.pending_wrap = false;
@@ -690,7 +715,7 @@ impl Grid {
     /// LF / IND: scroll up if at the bottom of the scroll region, otherwise move down one row (column unchanged).
     fn linefeed(&mut self) {
         if self.cursor.1 == self.scroll_bot {
-            self.scroll_up(self.scroll_top, self.scroll_bot, 1);
+            self.scroll_up_with_history(self.scroll_top, self.scroll_bot, 1);
         } else if self.cursor.1 + 1 < self.rows {
             self.cursor.1 += 1;
         }
@@ -711,6 +736,14 @@ impl Grid {
 
     /// Scroll the row range [top, bot] up by n rows, filling the bottom with blanks.
     fn scroll_up(&mut self, top: usize, bot: usize, n: usize) {
+        self.scroll_up_inner(top, bot, n, false);
+    }
+
+    fn scroll_up_with_history(&mut self, top: usize, bot: usize, n: usize) {
+        self.scroll_up_inner(top, bot, n, true);
+    }
+
+    fn scroll_up_inner(&mut self, top: usize, bot: usize, n: usize, save_history: bool) {
         if top >= bot || n == 0 {
             return;
         }
@@ -718,11 +751,26 @@ impl Grid {
         let h = bot - top + 1;
         let n = n.min(h);
         let end = (bot + 1) * cols;
+        if save_history && !self.alt && top == 0 && bot + 1 == self.rows {
+            self.push_scrollback_rows(0, n);
+        }
         if n < h {
             self.cells.copy_within((top + n) * cols..end, top * cols);
         }
         for r in (bot + 1 - n)..=bot {
             self.blank_row(r);
+        }
+    }
+
+    fn push_scrollback_rows(&mut self, top: usize, n: usize) {
+        let n = n.min(self.rows.saturating_sub(top));
+        for r in top..(top + n) {
+            let base = r * self.cols;
+            self.scrollback.push(self.cells[base..base + self.cols].to_vec());
+        }
+        let overflow = self.scrollback.len().saturating_sub(SCROLLBACK_LIMIT);
+        if overflow > 0 {
+            self.scrollback.drain(0..overflow);
         }
     }
 
@@ -798,10 +846,13 @@ impl Grid {
         let (c, r) = self.cursor;
         let idx = r * self.cols + c;
         let len = self.cells.len();
+        if mode == 3 {
+            self.scrollback.clear();
+        }
         match mode {
             0 => self.blank_range(idx, len),     // cursor to end of screen
             1 => self.blank_range(0, idx + 1),   // start of screen to cursor
-            2 | 3 => self.blank_range(0, len),   // whole screen (3 includes scrollback, which this layer lacks)
+            2 | 3 => self.blank_range(0, len),   // whole screen (3 also clears saved scrollback)
             _ => {}
         }
     }
@@ -980,6 +1031,11 @@ impl Grid {
         let drop_top = self.cursor.1.saturating_sub(rows - 1);
         self.cells = Self::resize_buf(&self.cells, oc, or, cols, rows, drop_top);
         self.inactive = Self::resize_buf(&self.inactive, oc, or, cols, rows, drop_top);
+        if cols != oc {
+            for row in &mut self.scrollback {
+                row.resize(cols, Cell::default());
+            }
+        }
         self.cols = cols;
         self.rows = rows;
         self.scroll_top = 0;
@@ -1026,6 +1082,7 @@ impl Grid {
         for cell in &mut self.inactive {
             *cell = Cell::default();
         }
+        self.scrollback.clear();
         self.alt = false;
         self.alt_saved = None;
         self.cursor = (0, 0);
@@ -1151,6 +1208,43 @@ mod tests {
         let mut g = Grid::new(3, 3);
         g.feed(b"1\r\n2\r\n3\r\n4");
         assert_eq!(g.to_lines(), vec!["2", "3", "4"]);
+    }
+
+    #[test]
+    fn scrollback_keeps_lines_scrolled_off_the_top() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"1\r\n2\r\n3");
+        assert_eq!(g.to_lines(), vec!["2", "3"]);
+        assert_eq!(g.scrollback_len(), 1);
+
+        let visible = |grid: &Grid, row, offset| {
+            (0..grid.cols)
+                .map(|c| grid.visible_cell(c, row, offset).ch)
+                .filter(|&ch| ch != '\0')
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(visible(&g, 0, 1), "1");
+        assert_eq!(visible(&g, 1, 1), "2");
+    }
+
+    #[test]
+    fn alt_screen_output_does_not_enter_scrollback() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"\x1b[?1049h");
+        g.feed(b"1\r\n2\r\n3");
+        assert_eq!(g.scrollback_len(), 0);
+        assert_eq!(g.max_scrollback_offset(), 0);
+    }
+
+    #[test]
+    fn erase_display_three_clears_scrollback() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"1\r\n2\r\n3");
+        assert_eq!(g.scrollback_len(), 1);
+        g.feed(b"\x1b[3J");
+        assert_eq!(g.scrollback_len(), 0);
     }
 
     #[test]

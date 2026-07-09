@@ -254,6 +254,14 @@ declare_class!(
         }
 
         // ---- Group/tab "⋯" menu-item handlers (tag holds the group index or tab id) ----
+        #[method(groupNewTab:)]
+        fn group_new_tab(&self, item: &NSMenuItem) {
+            let gi = unsafe { item.tag() } as usize;
+            if let Some(ctrl) = self.controller() {
+                ctrl.add_tab_in_group(gi);
+            }
+        }
+
         #[method(groupRename:)]
         fn group_rename(&self, item: &NSMenuItem) {
             let gi = unsafe { item.tag() } as usize;
@@ -400,7 +408,10 @@ impl SidebarView {
             .iter()
             .filter(|(_, t, _, _)| q.is_empty() || t.to_lowercase().contains(&q))
             .collect();
-        if !matched_ung.is_empty() {
+        // The "Sessions" section label is always shown (even with no ungrouped tabs), so the session
+        // list stays anchored and remains a visible drop target. During a search it's hidden only when
+        // no session matches, matching how empty groups drop out of the filtered list.
+        if q.is_empty() || !matched_ung.is_empty() {
             // "Sessions" section label above the tabs (matches the GROUP labels below).
             rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
             y += SECTION_H;
@@ -1141,6 +1152,8 @@ impl SidebarView {
             .and_then(|s| s.groups.get(gi).map(|g| g.collapsed))
             .unwrap_or(false);
         let menu = NSMenu::new(mtm);
+        menu.addItem(&self.menu_item("New Terminal", sel!(groupNewTab:), gi as isize));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&self.menu_item("Rename", sel!(groupRename:), gi as isize));
         let toggle = if collapsed { "Expand" } else { "Collapse" };
         menu.addItem(&self.menu_item(toggle, sel!(groupToggle:), gi as isize));

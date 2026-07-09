@@ -466,7 +466,13 @@ impl AppController {
                     let live = t.view.cwd();
                     if live.is_empty() { t.spawn_cwd.clone() } else { live }
                 })?;
-                let group = m.groups.iter().position(|g| g.tabs.contains(&a));
+                // If the active tab's group is collapsed, the new tab would be created hidden inside
+                // it. Place it at the top level (ungrouped) instead so it's visible.
+                let group = m
+                    .groups
+                    .iter()
+                    .position(|g| g.tabs.contains(&a))
+                    .filter(|&gi| !m.groups[gi].collapsed);
                 Some((a, group, cwd))
             })
         };
@@ -480,6 +486,35 @@ impl AppController {
                 if let Some((active_id, _, _)) = anchor {
                     self.place_tab_after(group, id, active_id);
                 }
+                self.select(id);
+                self.save();
+                self.refresh_sidebar();
+            }
+            None => self.alert_spawn_failed(),
+        }
+    }
+
+    /// Create a new terminal inside group `gi` (from the group row's "New Terminal" menu item).
+    /// Inherits the active tab's cwd when there is one, otherwise the default shell directory.
+    /// `spawn_tab` appends the new tab to the group's end.
+    pub fn add_tab_in_group(&self, gi: usize) {
+        if gi >= self.model.borrow().groups.len() {
+            return;
+        }
+        let cwd = {
+            let m = self.model.borrow();
+            m.active
+                .and_then(|a| {
+                    m.tabs.iter().find(|t| t.id == a).map(|t| {
+                        let live = t.view.cwd();
+                        if live.is_empty() { t.spawn_cwd.clone() } else { live }
+                    })
+                })
+                .unwrap_or_default()
+        };
+        let n = self.model.borrow().next_id;
+        match self.spawn_tab(Some(gi), format!("Terminal {}", n), &cwd, 0, false) {
+            Some(id) => {
                 self.select(id);
                 self.save();
                 self.refresh_sidebar();

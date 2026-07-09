@@ -7,6 +7,7 @@
 # macOS junk
 .DS_Store
 
-# Claude Code local/personal files (the shared CLAUDE.md stays tracked; ignore the rest)
-.claude/
+# Claude Code local/personal files (the shared CLAUDE.md and skills stay tracked; ignore the rest)
+.claude/*
+!.claude/skills/
 CLAUDE.local.md

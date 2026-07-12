@@ -395,6 +395,39 @@ impl AppController {
         self.update_title();
     }
 
+    /// Click the already-selected tab → deselect it; any other tab → select it.
+    pub fn toggle_select(&self, id: u64) {
+        if self.model.borrow().active == Some(id) {
+            self.deselect();
+        } else {
+            self.select(id);
+        }
+    }
+
+    /// Detach the active tab from the terminal area, leaving the empty-state placeholder.
+    /// The session keeps running (its PTY is untouched and its reader keeps feeding the grid);
+    /// selecting the tab again re-mounts the view with the output it produced meanwhile.
+    pub fn deselect(&self) {
+        {
+            let mut m = self.model.borrow_mut();
+            if m.active.is_none() {
+                return;
+            }
+            m.active = None;
+            // layout_active() early-returns without an active tab, so unmount the views here.
+            for t in &m.tabs {
+                unsafe { t.view.removeFromSuperview() };
+            }
+        }
+        self.show_placeholder();
+        // Hand first responder back to the window: with no terminal mounted there is nothing to
+        // type into, and a detached TermView must not keep receiving keyDown.
+        self.window.makeFirstResponder(None);
+        self.refresh_sidebar();
+        self.update_title();
+        self.defer_reposition_traffic_lights(); // makeFirstResponder relays out the titlebar
+    }
+
     /// Mount the active tab's view into the host (remove the others), and make it the keyboard first responder.
     fn layout_active(&self) {
         let m = self.model.borrow();
@@ -972,6 +1005,14 @@ impl AppController {
         self.sidebar.begin_search();
     }
 
+    /// ⌃↩: open the sidebar's context menu for the hovered row, or the active tab (expand first if collapsed).
+    pub fn open_sidebar_menu(&self) {
+        if self.collapsed.get() {
+            self.toggle_sidebar();
+        }
+        self.sidebar.open_context_menu();
+    }
+
     /// ⌘,: open the settings dialog (built lazily, then reused).
     pub fn open_settings(&self) {
         if self.settings_dialog.borrow().is_none() {
@@ -989,7 +1030,13 @@ impl AppController {
         let a = self.model.borrow().active;
         match a {
             Some(a) => self.close_tab_user(a),
-            None => unsafe { NSApplication::sharedApplication(self.mtm).terminate(None) },
+            // Nothing selected: quit only from the genuine empty state. With sessions still open
+            // (the user just deselected the active tab) ⌘W has no tab to close — do nothing rather
+            // than tear down the whole app.
+            None if self.model.borrow().tabs.is_empty() => unsafe {
+                NSApplication::sharedApplication(self.mtm).terminate(None)
+            },
+            None => {}
         }
     }
 

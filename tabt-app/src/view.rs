@@ -62,6 +62,9 @@ pub struct TermViewIvars {
     // IME composition (preedit): the in-progress marked text drawn inline at the cursor.
     // Empty when not composing. Set by setMarkedText:, cleared by insertText:/unmarkText.
     marked_text: RefCell<String>,
+    // Leftover trackpad scroll distance (pixels) below one line's worth, carried to the next event
+    // so a slow continuous swipe still advances instead of rounding to zero forever.
+    scroll_accum: Cell<f64>,
 }
 
 declare_class!(
@@ -120,6 +123,14 @@ declare_class!(
                 return;
             }
 
+            // Typing snaps the viewport back to the live bottom: the keystroke goes to the shell,
+            // and its echo/response would otherwise appear off-screen below the scrolled-back view.
+            // Bound to a local so the RefMut is released before key_seq() borrows the grid again.
+            let snapped = self.ivars().grid.borrow_mut().scroll_to_bottom();
+            if snapped {
+                unsafe { self.setNeedsDisplay(true) };
+            }
+
             // While an IME composition is active, every key belongs to the input system (to select a
             // candidate, extend/cancel the composition, etc.) — route it there unconditionally below.
             let composing = !self.ivars().marked_text.borrow().is_empty();
@@ -173,6 +184,27 @@ declare_class!(
         fn mouse_dragged(&self, event: &NSEvent) {
             self.ivars().sel_head.set(Some(self.cell_at(event)));
             unsafe { self.setNeedsDisplay(true) };
+        }
+
+        // ---- Scrollback ----
+        #[method(scrollWheel:)]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            // A trackpad reports precise per-pixel deltas; a mouse wheel reports whole lines.
+            // Positive deltaY means the content moves down, revealing older output above — which is
+            // exactly the direction `scroll_view` calls positive.
+            let dy = unsafe { event.scrollingDeltaY() };
+            let lines = if unsafe { event.hasPreciseScrollingDeltas() } {
+                let acc = self.ivars().scroll_accum.get() + dy;
+                let lines = (acc / settings::line_h()).trunc();
+                self.ivars().scroll_accum.set(acc - lines * settings::line_h());
+                lines as isize
+            } else {
+                self.ivars().scroll_accum.set(0.0);
+                dy.round() as isize
+            };
+            if lines != 0 && self.ivars().grid.borrow_mut().scroll_view(lines) {
+                unsafe { self.setNeedsDisplay(true) };
+            }
         }
 
         // ---- Edit menu actions (target=nil, travel the responder chain to reach the first responder) ----
@@ -348,6 +380,7 @@ impl TermView {
             close_fn: Cell::new(None),
             toggle_fn: Cell::new(None),
             closing: Cell::new(false),
+            scroll_accum: Cell::new(0.0),
             sel_anchor: Cell::new(None),
             sel_head: Cell::new(None),
             marked_text: RefCell::new(String::new()),
@@ -375,7 +408,10 @@ impl TermView {
 
     /// Clear screen (⌘K): directly feed ED(2) + cursor home to the Grid.
     pub fn clear(&self) {
-        self.ivars().grid.borrow_mut().feed(b"\x1b[2J\x1b[H");
+        let mut grid = self.ivars().grid.borrow_mut();
+        grid.feed(b"\x1b[2J\x1b[H");
+        grid.scroll_to_bottom(); // a cleared screen has nothing to read back to
+        drop(grid);
         unsafe { self.setNeedsDisplay(true) };
     }
 
@@ -552,7 +588,7 @@ impl TermView {
             let c1 = if r == er { ec } else { cols - 1 };
             let mut line = String::new();
             for c in c0..=c1 {
-                let ch = grid.cell(c, r).ch;
+                let ch = grid.view_cell(c, r).ch;
                 if ch != '\0' {
                     line.push(ch); // skip wide-char trailer placeholders
                 }
@@ -605,9 +641,9 @@ impl TermView {
             while c < cols {
                 // Merge adjacent cells starting at c with identical attributes into a single run.
                 let start = c;
-                let a0 = eff(grid.cell(start, r), &t);
+                let a0 = eff(grid.view_cell(start, r), &t);
                 c += 1;
-                while c < cols && eff(grid.cell(c, r), &t) == a0 {
+                while c < cols && eff(grid.view_cell(c, r), &t) == a0 {
                     c += 1;
                 }
                 let (fg, bg, flags) = a0;
@@ -622,7 +658,7 @@ impl TermView {
                 let run_x = PAD + start as f64 * cw;
                 // A wide lead char is always the last cell of its run (its trailer has distinct attrs),
                 // so if the cell just past the run is a trailer, extend the fill by one column to cover it.
-                let trailing = c < cols && grid.cell(c, r).flags & WIDE_TRAILER != 0;
+                let trailing = c < cols && grid.view_cell(c, r).flags & WIDE_TRAILER != 0;
                 let run_w = (c - start) as f64 * cw + if trailing { cw } else { 0.0 };
 
                 // Background: only fill non-default backgrounds (the default background is already covered by the whole-window background).
@@ -638,7 +674,7 @@ impl TermView {
                 // always breaks at a wide char (its trailer carries WIDE_TRAILER, a distinct attr set),
                 // so each wide glyph is drawn on its own, positioned at its exact cell origin.
                 let text: String = (start..c)
-                    .map(|i| grid.cell(i, r).ch)
+                    .map(|i| grid.view_cell(i, r).ch)
                     .filter(|&ch| ch != '\0')
                     .collect();
                 if !text.trim().is_empty() {
@@ -661,12 +697,14 @@ impl TermView {
 
 
         // Cursor: an inverse-video block (fill with the cursor cell's foreground color, then redraw the character in its background color).
-        if grid.cursor_visible() {
+        // Hidden while scrolled back into the scrollback: the cursor lives on the live screen, and
+        // painting it at the same row of a history viewport would mark an unrelated line.
+        if grid.cursor_visible() && grid.view_offset() == 0 {
             let (cc, cr) = grid.cursor;
             if cc < cols && cr < rows {
                 let x = PAD + cc as f64 * cw;
                 let y = PAD + cr as f64 * lh;
-                let cell = grid.cell(cc, cr);
+                let cell = grid.view_cell(cc, cr);
                 let (fg, bg, _) = eff(cell, &t);
                 // A wide glyph occupies two columns; the cursor block covers both.
                 let cur_w = if char_width(cell.ch) == 2 { 2.0 * cw } else { cw };
@@ -686,7 +724,7 @@ impl TermView {
         // IME preedit: draw the in-progress composition inline at the cursor, underlined, on top of
         // the grid (and the cursor block). Distinct RefCell from `grid`, so this borrow is independent.
         let marked = ivars.marked_text.borrow();
-        if !marked.is_empty() {
+        if !marked.is_empty() && grid.view_offset() == 0 {
             let (cc, cr) = grid.cursor;
             if cc < cols && cr < rows {
                 let x = PAD + cc as f64 * cw;

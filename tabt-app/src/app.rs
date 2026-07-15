@@ -370,7 +370,7 @@ impl AppController {
         let (fd, shell_pid) = pty::spawn(cols as u16, rows as u16, cwd)?;
         let frame = self.host.bounds();
         let v = TermView::new(self.mtm, frame, fd, cols, rows);
-        v.attach(self as *const AppController as *const c_void, id, close_cb, toggle_cb);
+        v.attach(self as *const AppController as *const c_void, id, end_cb, restart_cb, toggle_cb);
         let reader = view::attach_reader(&v);
 
         let mut m = self.model.borrow_mut();
@@ -751,10 +751,44 @@ impl AppController {
             .or_else(|| order.get(pos + 1).copied())
     }
 
-    /// Close a tab because its shell process exited on its own. If it was the last tab, the app
-    /// quits — nothing is left running, unlike an explicit user-initiated close (see `close_tab_user`).
-    pub fn close_tab(&self, id: u64) {
-        self.close_tab_impl(id, true);
+    /// The shell exited on its own (EOF/read error): tear down the now-dead reader/fd but keep the
+    /// tab and its view — TermView shows a "session ended" placeholder (see `view::TermView::restart`)
+    /// until the user restarts it (Enter) or closes the tab explicitly (⌘W).
+    fn end_tab_session(&self, id: u64) {
+        let mut m = self.model.borrow_mut();
+        if let Some(t) = m.tabs.iter_mut().find(|t| t.id == id) {
+            view::cancel_reader(&t.reader);
+            unsafe { libc::close(t.master_fd) };
+            t.master_fd = -1;
+            t.shell_pid = -1; // tcgetpgrp(-1) fails, so has_foreground_job reports false
+        }
+    }
+
+    /// Respawn a fresh shell into a tab whose previous one already ended (see `end_tab_session`),
+    /// reusing its last known working directory. Fired when the user presses Enter on an ended tab.
+    pub fn restart_tab(&self, id: u64) {
+        let cwd = match self.model.borrow().tabs.iter().find(|t| t.id == id) {
+            Some(t) => {
+                let live = t.view.cwd();
+                if live.is_empty() { t.spawn_cwd.clone() } else { live }
+            }
+            None => return,
+        };
+        let (cols, rows) = self.dims();
+        let (fd, shell_pid) = match pty::spawn(cols as u16, rows as u16, &cwd) {
+            Some(v) => v,
+            None => return, // out of fds/process table etc.: leave the tab ended, nothing else to do
+        };
+        let mut m = self.model.borrow_mut();
+        match m.tabs.iter_mut().find(|t| t.id == id) {
+            Some(t) => {
+                t.master_fd = fd;
+                t.shell_pid = shell_pid;
+                t.reader = view::attach_reader(&t.view);
+                t.view.restart(fd, cols, rows);
+            }
+            None => unsafe { libc::close(fd); }, // tab closed meanwhile: don't leak the new pty
+        }
     }
 
     /// Close a tab the user explicitly asked to close (⌘W, or "Close" in the tab's "⋯" menu).
@@ -770,7 +804,7 @@ impl AppController {
         if self.tab_has_foreground_job(id) && !confirm(self.mtm, "Close this tab?", RUNNING_JOB_WARNING, "Close") {
             return;
         }
-        self.close_tab_impl(id, false);
+        self.close_tab_impl(id);
     }
 
     /// ⌘Q (via the app delegate's `applicationShouldTerminate:`): if any open tab has a
@@ -809,19 +843,15 @@ impl AppController {
         self.save();
     }
 
-    fn close_tab_impl(&self, id: u64, quit_if_empty: bool) {
+    fn close_tab_impl(&self, id: u64) {
         let was_active = self.model.borrow().active == Some(id);
         // The neighbor tab must be computed before teardown (at this point id is still in visual order).
         let neighbor = if was_active { self.adjacent_tab(id) } else { None };
         if !self.teardown_tab(id) {
             return;
         }
-        // Last tab closed.
+        // Last tab closed: stay open with the empty-state placeholder rather than quitting.
         if self.model.borrow().tabs.is_empty() {
-            if quit_if_empty {
-                unsafe { NSApplication::sharedApplication(self.mtm).terminate(None) };
-                return;
-            }
             self.went_empty();
             return;
         }
@@ -1141,10 +1171,17 @@ fn confirm(mtm: MainThreadMarker, title: &str, info: &str, affirmative: &str) ->
     }
 }
 
-/// TermView calls back into the controller through this when the shell exits (see `view::CloseFn`).
-fn close_cb(ctx: *const c_void, id: u64) {
+/// TermView calls back into the controller through this when the shell exits (see `view::EndFn`).
+fn end_cb(ctx: *const c_void, id: u64) {
     let ctrl = unsafe { &*(ctx as *const AppController) };
-    ctrl.close_tab(id);
+    ctrl.end_tab_session(id);
+}
+
+/// TermView calls back into the controller through this when the user presses Enter on an ended
+/// tab (see `view::RestartFn`).
+fn restart_cb(ctx: *const c_void, id: u64) {
+    let ctrl = unsafe { &*(ctx as *const AppController) };
+    ctrl.restart_tab(id);
 }
 
 /// When TermView receives ⌘B it calls back into the controller to collapse the sidebar (see `view::CmdFn`).

@@ -81,6 +81,10 @@ declare_class!(
         fn open_settings(&self, _s: Option<&AnyObject>) {
             self.with(|c| c.open_settings());
         }
+        #[method(sidebarMenu:)]
+        fn sidebar_menu(&self, _s: Option<&AnyObject>) {
+            self.with(|c| c.open_sidebar_menu());
+        }
 
         // As the app delegate: before quitting, flush layout + session state to disk (cwd + content snapshot of each tab).
         #[method(applicationWillTerminate:)]
@@ -145,6 +149,24 @@ fn add(
     key: &str,
     shift: bool,
 ) {
+    let mods = shift.then(|| {
+        NSEventModifierFlags::NSEventModifierFlagCommand
+            | NSEventModifierFlags::NSEventModifierFlagShift
+    });
+    add_mods(mtm, menu, title, action, target, key, mods);
+}
+
+/// Like [`add`], but with an explicit modifier mask (`None` keeps AppKit's ⌘ default) — needed for
+/// the few shortcuts that aren't ⌘-based, e.g. ⌃↩.
+fn add_mods(
+    mtm: MainThreadMarker,
+    menu: &NSMenu,
+    title: &str,
+    action: Option<Sel>,
+    target: Option<&MenuTarget>,
+    key: &str,
+    mods: Option<NSEventModifierFlags>,
+) {
     let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc(),
@@ -158,11 +180,8 @@ fn add(
             let _: () = msg_send![&item, setTarget: t];
         }
     }
-    if shift {
-        item.setKeyEquivalentModifierMask(
-            NSEventModifierFlags::NSEventModifierFlagCommand
-                | NSEventModifierFlags::NSEventModifierFlagShift,
-        );
+    if let Some(m) = mods {
+        item.setKeyEquivalentModifierMask(m);
     }
     menu.addItem(&item);
 }
@@ -209,6 +228,16 @@ pub fn build_menu(mtm: MainThreadMarker, app: &NSApplication, target: &MenuTarge
     // ---- View (color/font and other settings have been merged into the sidebar's bottom "Settings"; only zoom shortcuts remain here) ----
     let view = submenu(mtm, &menubar, "View");
     add(mtm, &view, "Toggle Sidebar", Some(sel!(toggleSidebar:)), Some(target), "b", false);
+    // ⌃↩ — opens the context menu of the hovered sidebar row, else the active tab's.
+    add_mods(
+        mtm,
+        &view,
+        "Sidebar Context Menu",
+        Some(sel!(sidebarMenu:)),
+        Some(target),
+        "\r",
+        Some(NSEventModifierFlags::NSEventModifierFlagControl),
+    );
     add(mtm, &view, "Clear", Some(sel!(clearScreen:)), Some(target), "k", false);
     view.addItem(&NSMenuItem::separatorItem(mtm));
     // ⌘= (no Shift) to zoom in, ⌘- to zoom out — the bare-key form, no need to reach for Shift.

@@ -39,29 +39,43 @@ pub(crate) const PAD: f64 = 10.0;
 /// Zero means the standard/default line height (the font's own natural glyph height).
 const LINE_GAP: f64 = 0.0;
 
-/// Callback for session end (shell exit): (context, tab id). Uses a raw pointer + function pointer
-/// rather than depending on the AppController type directly, to avoid a view ↔ app circular dependency.
-pub type CloseFn = fn(*const c_void, u64);
+/// Callback for the shell exiting on its own (EOF/read error): (context, tab id). The tab and its
+/// view are kept alive — TermView shows a "session ended" placeholder (see `mark_ended`) until the
+/// user restarts it (`RestartFn`) or closes the tab explicitly. Uses a raw pointer + function
+/// pointer rather than depending on the AppController type directly, to avoid a view ↔ app circular
+/// dependency.
+pub type EndFn = fn(*const c_void, u64);
+
+/// Callback to respawn a fresh shell into an ended tab (context, tab id), fired when the user
+/// presses Enter while the tab shows its "session ended" state (see `mark_ended`/`restart`).
+pub type RestartFn = fn(*const c_void, u64);
 
 /// Argument-less command callback (e.g. ⌘B to collapse the sidebar).
 pub type CmdFn = fn(*const c_void);
 
 pub struct TermViewIvars {
     grid: RefCell<Grid>,
-    master_fd: RawFd,
+    // Mutable: `restart()` swaps in a fresh fd after the previous shell has ended.
+    master_fd: Cell<RawFd>,
     // Font/metrics come from the global crate::settings (changing the font takes effect immediately for all terminals).
-    // Multi-tab support: this tab's id + exit callback. When there is no callback (default), it falls back to exiting the whole process.
+    // Multi-tab support: this tab's id + callbacks. When there is no callback (default), end falls back to exiting the whole process.
     tab_id: Cell<u64>,
     close_ctx: Cell<*const c_void>,
-    close_fn: Cell<Option<CloseFn>>,
+    end_fn: Cell<Option<EndFn>>,
+    restart_fn: Cell<Option<RestartFn>>,
     toggle_fn: Cell<Option<CmdFn>>, // ⌘B to collapse the sidebar
-    closing: Cell<bool>,
+    // The shell exited (EOF/read error) and hasn't been restarted yet: input is ignored except
+    // Enter, which triggers `restart_fn`. See `mark_ended`/`restart`.
+    ended: Cell<bool>,
     // Mouse selection: anchor + current drag point (cell coordinates (col,row)); equal = empty selection.
     sel_anchor: Cell<Option<(usize, usize)>>,
     sel_head: Cell<Option<(usize, usize)>>,
     // IME composition (preedit): the in-progress marked text drawn inline at the cursor.
     // Empty when not composing. Set by setMarkedText:, cleared by insertText:/unmarkText.
     marked_text: RefCell<String>,
+    // Leftover trackpad scroll distance (pixels) below one line's worth, carried to the next event
+    // so a slow continuous swipe still advances instead of rounding to zero forever.
+    scroll_accum: Cell<f64>,
 }
 
 declare_class!(
@@ -103,7 +117,19 @@ declare_class!(
 
         #[method(keyDown:)]
         fn key_down(&self, event: &NSEvent) {
-            let fd = self.ivars().master_fd;
+            // Session already ended: there is no shell to type into. Only Enter/Return means
+            // anything here — it restarts a fresh shell in place; every other key is a no-op.
+            if self.ivars().ended.get() {
+                let keycode = unsafe { event.keyCode() };
+                if keycode == 36 || keycode == 76 {
+                    if let Some(f) = self.ivars().restart_fn.get() {
+                        f(self.ivars().close_ctx.get(), self.ivars().tab_id.get());
+                    }
+                }
+                return;
+            }
+
+            let fd = self.ivars().master_fd.get();
             let flags = unsafe { event.modifierFlags() };
             let cmd = flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand);
             let ctrl = flags.contains(NSEventModifierFlags::NSEventModifierFlagControl);
@@ -118,6 +144,14 @@ declare_class!(
                     }
                 }
                 return;
+            }
+
+            // Typing snaps the viewport back to the live bottom: the keystroke goes to the shell,
+            // and its echo/response would otherwise appear off-screen below the scrolled-back view.
+            // Bound to a local so the RefMut is released before key_seq() borrows the grid again.
+            let snapped = self.ivars().grid.borrow_mut().scroll_to_bottom();
+            if snapped {
+                unsafe { self.setNeedsDisplay(true) };
             }
 
             // While an IME composition is active, every key belongs to the input system (to select a
@@ -175,6 +209,27 @@ declare_class!(
             unsafe { self.setNeedsDisplay(true) };
         }
 
+        // ---- Scrollback ----
+        #[method(scrollWheel:)]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            // A trackpad reports precise per-pixel deltas; a mouse wheel reports whole lines.
+            // Positive deltaY means the content moves down, revealing older output above — which is
+            // exactly the direction `scroll_view` calls positive.
+            let dy = unsafe { event.scrollingDeltaY() };
+            let lines = if unsafe { event.hasPreciseScrollingDeltas() } {
+                let acc = self.ivars().scroll_accum.get() + dy;
+                let lines = (acc / settings::line_h()).trunc();
+                self.ivars().scroll_accum.set(acc - lines * settings::line_h());
+                lines as isize
+            } else {
+                self.ivars().scroll_accum.set(0.0);
+                dy.round() as isize
+            };
+            if lines != 0 && self.ivars().grid.borrow_mut().scroll_view(lines) {
+                unsafe { self.setNeedsDisplay(true) };
+            }
+        }
+
         // ---- Edit menu actions (target=nil, travel the responder chain to reach the first responder) ----
         #[method(copy:)]
         fn copy_action(&self, _sender: Option<&AnyObject>) {
@@ -197,7 +252,7 @@ declare_class!(
             if let Some(s) = s {
                 let bytes = s.to_string().into_bytes();
                 if !bytes.is_empty() {
-                    let fd = self.ivars().master_fd;
+                    let fd = self.ivars().master_fd.get();
                     // Bracketed paste (DECSET 2004): wrap the paste so the program can tell it
                     // apart from typed keystrokes, e.g. a shell won't try to execute each
                     // newline-terminated line of a multi-line paste immediately.
@@ -237,7 +292,7 @@ declare_class!(
             let text = ns_input_string(string);
             self.ivars().marked_text.borrow_mut().clear();
             if !text.is_empty() {
-                unsafe { write_all(self.ivars().master_fd, text.as_bytes()) };
+                unsafe { write_all(self.ivars().master_fd.get(), text.as_bytes()) };
             }
             unsafe { self.setNeedsDisplay(true) };
         }
@@ -342,12 +397,14 @@ impl TermView {
         let this = mtm.alloc();
         let this = this.set_ivars(TermViewIvars {
             grid: RefCell::new(Grid::new(cols, rows)),
-            master_fd,
+            master_fd: Cell::new(master_fd),
             tab_id: Cell::new(0),
             close_ctx: Cell::new(std::ptr::null()),
-            close_fn: Cell::new(None),
+            end_fn: Cell::new(None),
+            restart_fn: Cell::new(None),
             toggle_fn: Cell::new(None),
-            closing: Cell::new(false),
+            ended: Cell::new(false),
+            scroll_accum: Cell::new(0.0),
             sel_anchor: Cell::new(None),
             sel_head: Cell::new(None),
             marked_text: RefCell::new(String::new()),
@@ -375,37 +432,52 @@ impl TermView {
 
     /// Clear screen (⌘K): directly feed ED(2) + cursor home to the Grid.
     pub fn clear(&self) {
-        self.ivars().grid.borrow_mut().feed(b"\x1b[2J\x1b[H");
+        let mut grid = self.ivars().grid.borrow_mut();
+        grid.feed(b"\x1b[2J\x1b[H");
+        grid.scroll_to_bottom(); // a cleared screen has nothing to read back to
+        drop(grid);
         unsafe { self.setNeedsDisplay(true) };
     }
 
-    /// Bind the owning tab id, exit callback, and ⌘B collapse callback (called by AppController after creation).
-    pub fn attach(&self, ctx: *const c_void, tab_id: u64, close: CloseFn, toggle: CmdFn) {
+    /// Bind the owning tab id, end/restart callbacks, and ⌘B collapse callback (called by AppController after creation).
+    pub fn attach(&self, ctx: *const c_void, tab_id: u64, end: EndFn, restart: RestartFn, toggle: CmdFn) {
         self.ivars().tab_id.set(tab_id);
         self.ivars().close_ctx.set(ctx);
-        self.ivars().close_fn.set(Some(close));
+        self.ivars().end_fn.set(Some(end));
+        self.ivars().restart_fn.set(Some(restart));
         self.ivars().toggle_fn.set(Some(toggle));
     }
 
-    /// shell exit: defer the close action to the next runloop tick — we must never release
-    /// ourselves (the last Retained) directly inside on_readable (a method on self).
-    fn schedule_close(&self) {
-        if self.ivars().closing.get() {
+    /// The shell exited (EOF or a fatal read error): print a status line into the grid, flip into
+    /// the "ended" state (ignores all input but Enter until restarted), and notify the controller
+    /// so it can cancel the now-dead reader/fd. The tab and view stay mounted — `restart` revives
+    /// them in place, so unlike the old close-on-exit behavior nothing here tears down `self`.
+    fn mark_ended(&self) {
+        if self.ivars().ended.get() {
             return;
         }
-        self.ivars().closing.set(true);
-        match self.ivars().close_fn.get() {
-            None => std::process::exit(0), // No controller (single-terminal case): legacy behavior
-            Some(f) => {
-                let ctx = self.ivars().close_ctx.get();
-                let id = self.ivars().tab_id.get();
-                let boxed = Box::into_raw(Box::new((ctx, id, f)));
-                unsafe {
-                    let q: dispatch::Queue = &dispatch::_dispatch_main_q as *const _ as *mut _;
-                    dispatch::dispatch_async_f(q, boxed as *mut c_void, close_trampoline);
-                }
-            }
+        self.ivars().ended.set(true);
+        {
+            let mut grid = self.ivars().grid.borrow_mut();
+            grid.feed(b"\r\n\x1b[33m[Session ended -- press Enter to restart]\x1b[0m");
+            grid.scroll_to_bottom();
         }
+        unsafe { self.setNeedsDisplay(true) };
+        match self.ivars().end_fn.get() {
+            None => std::process::exit(0), // No controller (single-terminal case): legacy behavior
+            Some(f) => f(self.ivars().close_ctx.get(), self.ivars().tab_id.get()),
+        }
+    }
+
+    /// Respawn a fresh shell into this (already-ended) tab in place: swap in the new master fd,
+    /// reset the grid to a clean slate, and clear the "ended" state. Called by AppController once
+    /// it has spawned the replacement PTY (see `RestartFn`).
+    pub fn restart(&self, fd: RawFd, cols: usize, rows: usize) {
+        self.ivars().master_fd.set(fd);
+        *self.ivars().grid.borrow_mut() = Grid::new(cols, rows);
+        self.clear_selection();
+        self.ivars().ended.set(false);
+        unsafe { self.setNeedsDisplay(true) };
     }
 
     /// Map a key event to a terminal byte sequence. Returning None means it is not a special key,
@@ -449,10 +521,10 @@ impl TermView {
 
     /// GCD dispatch source fires: drain all readable data from the master, feed it to the Grid, then request a redraw.
     fn on_readable(&self) {
-        if self.ivars().closing.get() {
-            return; // Already closing: EOF fires repeatedly, just ignore it
+        if self.ivars().ended.get() {
+            return; // Already ended: EOF/read errors keep firing on the dead fd, ignore them
         }
-        let fd = self.ivars().master_fd;
+        let fd = self.ivars().master_fd.get();
         let mut buf = [0u8; 8192];
         let mut dirty = false;
         loop {
@@ -470,14 +542,14 @@ impl TermView {
                 }
                 dirty = true;
             } else if r == 0 {
-                self.schedule_close(); // shell exit (EOF)
+                self.mark_ended(); // shell exit (EOF)
                 break;
             } else {
                 match std::io::Error::last_os_error().raw_os_error() {
                     Some(libc::EINTR) => continue,
                     Some(libc::EAGAIN) => break,  // Drained
                     _ => {
-                        self.schedule_close(); // EIO etc.: the shell is gone
+                        self.mark_ended(); // EIO etc.: the shell is gone
                         break;
                     }
                 }
@@ -511,7 +583,7 @@ impl TermView {
             ws_ypixel: 0,
         };
         unsafe {
-            libc::ioctl(ivars.master_fd, libc::TIOCSWINSZ, &ws);
+            libc::ioctl(ivars.master_fd.get(), libc::TIOCSWINSZ, &ws);
             self.setNeedsDisplay(true);
         }
     }
@@ -552,7 +624,7 @@ impl TermView {
             let c1 = if r == er { ec } else { cols - 1 };
             let mut line = String::new();
             for c in c0..=c1 {
-                let ch = grid.cell(c, r).ch;
+                let ch = grid.view_cell(c, r).ch;
                 if ch != '\0' {
                     line.push(ch); // skip wide-char trailer placeholders
                 }
@@ -605,9 +677,9 @@ impl TermView {
             while c < cols {
                 // Merge adjacent cells starting at c with identical attributes into a single run.
                 let start = c;
-                let a0 = eff(grid.cell(start, r), &t);
+                let a0 = eff(grid.view_cell(start, r), &t);
                 c += 1;
-                while c < cols && eff(grid.cell(c, r), &t) == a0 {
+                while c < cols && eff(grid.view_cell(c, r), &t) == a0 {
                     c += 1;
                 }
                 let (fg, bg, flags) = a0;
@@ -622,7 +694,7 @@ impl TermView {
                 let run_x = PAD + start as f64 * cw;
                 // A wide lead char is always the last cell of its run (its trailer has distinct attrs),
                 // so if the cell just past the run is a trailer, extend the fill by one column to cover it.
-                let trailing = c < cols && grid.cell(c, r).flags & WIDE_TRAILER != 0;
+                let trailing = c < cols && grid.view_cell(c, r).flags & WIDE_TRAILER != 0;
                 let run_w = (c - start) as f64 * cw + if trailing { cw } else { 0.0 };
 
                 // Background: only fill non-default backgrounds (the default background is already covered by the whole-window background).
@@ -638,7 +710,7 @@ impl TermView {
                 // always breaks at a wide char (its trailer carries WIDE_TRAILER, a distinct attr set),
                 // so each wide glyph is drawn on its own, positioned at its exact cell origin.
                 let text: String = (start..c)
-                    .map(|i| grid.cell(i, r).ch)
+                    .map(|i| grid.view_cell(i, r).ch)
                     .filter(|&ch| ch != '\0')
                     .collect();
                 if !text.trim().is_empty() {
@@ -661,12 +733,14 @@ impl TermView {
 
 
         // Cursor: an inverse-video block (fill with the cursor cell's foreground color, then redraw the character in its background color).
-        if grid.cursor_visible() {
+        // Hidden while scrolled back into the scrollback: the cursor lives on the live screen, and
+        // painting it at the same row of a history viewport would mark an unrelated line.
+        if grid.cursor_visible() && grid.view_offset() == 0 {
             let (cc, cr) = grid.cursor;
             if cc < cols && cr < rows {
                 let x = PAD + cc as f64 * cw;
                 let y = PAD + cr as f64 * lh;
-                let cell = grid.cell(cc, cr);
+                let cell = grid.view_cell(cc, cr);
                 let (fg, bg, _) = eff(cell, &t);
                 // A wide glyph occupies two columns; the cursor block covers both.
                 let cur_w = if char_width(cell.ch) == 2 { 2.0 * cw } else { cw };
@@ -686,7 +760,7 @@ impl TermView {
         // IME preedit: draw the in-progress composition inline at the cursor, underlined, on top of
         // the grid (and the cursor block). Distinct RefCell from `grid`, so this borrow is independent.
         let marked = ivars.marked_text.borrow();
-        if !marked.is_empty() {
+        if !marked.is_empty() && grid.view_offset() == 0 {
             let (cc, cr) = grid.cursor;
             if cc < cols && cr < rows {
                 let x = PAD + cc as f64 * cw;
@@ -874,7 +948,7 @@ pub fn attach_reader(view: &TermView) -> ReaderToken {
         let view: &TermView = unsafe { &*(ctx as *const TermView) };
         view.on_readable();
     }
-    let fd = view.ivars().master_fd;
+    let fd = view.ivars().master_fd.get();
     unsafe {
         let queue: dispatch::Queue = &dispatch::_dispatch_main_q as *const _ as *mut _;
         let ty: dispatch::SourceType = &dispatch::_dispatch_source_type_read;
@@ -889,13 +963,6 @@ pub fn attach_reader(view: &TermView) -> ReaderToken {
 /// Cancel the reader (called when the tab closes).
 pub fn cancel_reader(t: &ReaderToken) {
     unsafe { dispatch::dispatch_source_cancel(t.0) };
-}
-
-/// Landing point for schedule_close's deferred execution: calls back CloseFn on a main-queue tick.
-extern "C" fn close_trampoline(p: *mut c_void) {
-    let b = unsafe { Box::from_raw(p as *mut (*const c_void, u64, CloseFn)) };
-    let (ctx, id, f) = *b;
-    f(ctx, id);
 }
 
 unsafe fn write_all(fd: RawFd, mut data: &[u8]) {

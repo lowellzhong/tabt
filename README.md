@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" width="120" alt="TabT logo" />
+  <img src="tabt.png" width="120" alt="TabT logo" />
 </p>
 
 # TabT

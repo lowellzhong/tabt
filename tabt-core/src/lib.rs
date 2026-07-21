@@ -19,8 +19,14 @@
 //!     `take_replies()` for the caller to write back to the PTY;
 //!   - UTF-8 multibyte character decoding.
 //!
-//! Still not implemented (left for later milestones): a scrollback buffer (once content scrolls
-//! off the top it's gone for the session) and custom tab stops.
+//!   - a scrollback buffer: lines that scroll off the top of the main screen are kept in
+//!     `history` (capped at `HISTORY_MAX`), and the renderer reads through `view_cell()` so the
+//!     viewport can be scrolled back with `scroll_view()`.
+//!
+//! Still not implemented (left for later milestones): custom tab stops, and reflowing the
+//! scrollback when the window is resized.
+
+use std::collections::VecDeque;
 
 /// A single screen cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +42,13 @@ impl Default for Cell {
         Cell { ch: ' ', fg: Color::Default, bg: Color::Default, flags: 0 }
     }
 }
+
+/// A blank cell, returned by `view_cell()` for columns past the end of a (trimmed) history row.
+const BLANK: Cell = Cell { ch: ' ', fg: Color::Default, bg: Color::Default, flags: 0 };
+
+/// Maximum number of scrolled-off lines retained per grid. Rows are stored with their trailing
+/// blank cells trimmed, so a typical shell session costs far less than `HISTORY_MAX * cols`.
+pub const HISTORY_MAX: usize = 5000;
 
 // Cell attribute bits.
 pub const BOLD: u8 = 1 << 0;
@@ -138,6 +151,15 @@ pub struct Grid {
     scroll_top: usize,
     scroll_bot: usize,
 
+    // ---- Scrollback ----
+    // Lines that scrolled off the top of the main screen, oldest first, capped at HISTORY_MAX.
+    // Rows are trimmed of trailing blank cells; `view_cell` substitutes BLANK past a row's end.
+    // The alt screen never contributes here (vim/less redraw themselves; their scrolling is not history).
+    history: VecDeque<Vec<Cell>>,
+    // How many lines the viewport is scrolled back from the live bottom. 0 = following the output.
+    // Always <= history.len().
+    view_offset: usize,
+
     // ---- Modes ----
     autowrap: bool,
     cursor_visible: bool,
@@ -186,6 +208,8 @@ impl Grid {
             alt_saved: None,
             scroll_top: 0,
             scroll_bot: rows.saturating_sub(1),
+            history: VecDeque::new(),
+            view_offset: 0,
             autowrap: true,
             cursor_visible: true,
             app_cursor_keys: false,
@@ -210,6 +234,55 @@ impl Grid {
 
     pub fn cell_mut(&mut self, col: usize, row: usize) -> &mut Cell {
         &mut self.cells[row * self.cols + col]
+    }
+
+    // ===================== Scrollback viewport =====================
+
+    /// The cell shown at viewport position (col, row) — the accessor the renderer must use.
+    ///
+    /// With `view_offset == 0` this is exactly `cell(col, row)`. Scrolled back by `o` lines, the
+    /// viewport shows the last `o` history lines on top, followed by the first `rows - o` screen
+    /// rows. History rows are stored trimmed, so columns past a row's end read as blank.
+    pub fn view_cell(&self, col: usize, row: usize) -> &Cell {
+        let o = self.view_offset;
+        if row < o {
+            // history.len() >= o is an invariant of scroll_view/push_history, so this can't underflow.
+            let line = &self.history[self.history.len() - o + row];
+            return line.get(col).unwrap_or(&BLANK);
+        }
+        self.cell(col, row - o)
+    }
+
+    /// Number of lines retained in the scrollback.
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// How many lines the viewport is scrolled back from the live bottom (0 = following output).
+    pub fn view_offset(&self) -> usize {
+        self.view_offset
+    }
+
+    /// Scroll the viewport by `lines` (positive = back toward older output). Clamped to the
+    /// available history. No-op on the alt screen, which has no scrollback of its own.
+    /// Returns whether the offset actually changed (i.e. whether a redraw is needed).
+    pub fn scroll_view(&mut self, lines: isize) -> bool {
+        if self.alt {
+            return false;
+        }
+        let max = self.history.len() as isize;
+        let next = (self.view_offset as isize + lines).clamp(0, max) as usize;
+        let changed = next != self.view_offset;
+        self.view_offset = next;
+        changed
+    }
+
+    /// Snap the viewport back to the live bottom (on keypress, clear, alt-screen switch).
+    /// Returns whether the offset actually changed.
+    pub fn scroll_to_bottom(&mut self) -> bool {
+        let changed = self.view_offset != 0;
+        self.view_offset = 0;
+        changed
     }
 
     /// Whether the cursor is shown (DECTCEM), for the rendering layer's reference.
@@ -561,7 +634,7 @@ impl Grid {
             b'@' => self.insert_chars(self.p1(0)),
             b'P' => self.delete_chars(self.p1(0)),
             b'X' => self.erase_chars(self.p1(0)),
-            b'S' => self.scroll_up(self.scroll_top, self.scroll_bot, self.p1(0)),
+            b'S' => self.scroll_up_saving(self.scroll_top, self.scroll_bot, self.p1(0)),
             b'T' => self.scroll_down(self.scroll_top, self.scroll_bot, self.p1(0)),
             b'h' => self.set_mode(true),
             b'l' => self.set_mode(false),
@@ -690,7 +763,7 @@ impl Grid {
     /// LF / IND: scroll up if at the bottom of the scroll region, otherwise move down one row (column unchanged).
     fn linefeed(&mut self) {
         if self.cursor.1 == self.scroll_bot {
-            self.scroll_up(self.scroll_top, self.scroll_bot, 1);
+            self.scroll_up_saving(self.scroll_top, self.scroll_bot, 1);
         } else if self.cursor.1 + 1 < self.rows {
             self.cursor.1 += 1;
         }
@@ -707,6 +780,46 @@ impl Grid {
             self.cursor.1 -= 1;
         }
         self.pending_wrap = false;
+    }
+
+    /// Scroll up, first pushing the rows about to be discarded into the scrollback.
+    ///
+    /// Only content that genuinely falls off the top of the screen belongs in history, so this is
+    /// called from `linefeed`/SU — never from the shared `scroll_up`. `delete_lines` (DL) also
+    /// reaches `scroll_up(0, …)` when the cursor sits on row 0, and those lines were deleted by the
+    /// application, not scrolled away: saving them would corrupt the scrollback with text the user
+    /// never saw scroll past. The alt screen and any partial scroll region are excluded for the
+    /// same reason.
+    fn scroll_up_saving(&mut self, top: usize, bot: usize, n: usize) {
+        if top >= bot || n == 0 {
+            return;
+        }
+        if !self.alt && top == 0 {
+            let n = n.min(bot - top + 1);
+            for r in 0..n {
+                self.push_history(r);
+            }
+        }
+        self.scroll_up(top, bot, n);
+    }
+
+    /// Copy screen row `r` into the scrollback, trimming trailing blank cells.
+    ///
+    /// Keeps the viewport pinned to the same content while scrolled back: appending a line shifts
+    /// every visible line up by one, so `view_offset` grows to compensate. Once history is at cap
+    /// the oldest line is evicted, and the clamp against the (unchanged) length keeps the top of
+    /// the scrollback from scrolling out from under the viewport.
+    fn push_history(&mut self, r: usize) {
+        let base = r * self.cols;
+        let row = &self.cells[base..base + self.cols];
+        let end = row.iter().rposition(|c| *c != BLANK).map_or(0, |i| i + 1);
+        if self.history.len() == HISTORY_MAX {
+            self.history.pop_front();
+        }
+        self.history.push_back(row[..end].to_vec());
+        if self.view_offset > 0 {
+            self.view_offset = (self.view_offset + 1).min(self.history.len());
+        }
     }
 
     /// Scroll the row range [top, bot] up by n rows, filling the bottom with blanks.
@@ -799,9 +912,15 @@ impl Grid {
         let idx = r * self.cols + c;
         let len = self.cells.len();
         match mode {
-            0 => self.blank_range(idx, len),     // cursor to end of screen
-            1 => self.blank_range(0, idx + 1),   // start of screen to cursor
-            2 | 3 => self.blank_range(0, len),   // whole screen (3 includes scrollback, which this layer lacks)
+            0 => self.blank_range(idx, len),   // cursor to end of screen
+            1 => self.blank_range(0, idx + 1), // start of screen to cursor
+            2 => self.blank_range(0, len),     // whole screen
+            3 => {
+                // ED 3 (xterm): whole screen *and* the scrollback.
+                self.blank_range(0, len);
+                self.history.clear();
+                self.view_offset = 0;
+            }
             _ => {}
         }
     }
@@ -945,6 +1064,7 @@ impl Grid {
             return;
         }
         self.alt = true;
+        self.view_offset = 0; // the alt screen has no scrollback; never show it through one
         std::mem::swap(&mut self.cells, &mut self.inactive);
         for cell in &mut self.cells {
             *cell = Cell::default();
@@ -960,6 +1080,7 @@ impl Grid {
             return;
         }
         self.alt = false;
+        self.view_offset = 0; // land on the live bottom of the restored main screen
         std::mem::swap(&mut self.cells, &mut self.inactive);
         self.pending_wrap = false;
     }
@@ -987,6 +1108,9 @@ impl Grid {
         self.cursor.1 = (self.cursor.1 - drop_top).min(rows - 1);
         self.cursor.0 = self.cursor.0.min(cols - 1);
         self.pending_wrap = false;
+        // History rows keep their old width (no reflow); `view_cell` pads short rows with blanks
+        // and ignores the overhang, so only the offset needs re-clamping.
+        self.view_offset = self.view_offset.min(self.history.len());
     }
 
     /// Move a buffer into the new dimensions: columns left-aligned, rows top-anchored after dropping
@@ -1151,6 +1275,143 @@ mod tests {
         let mut g = Grid::new(3, 3);
         g.feed(b"1\r\n2\r\n3\r\n4");
         assert_eq!(g.to_lines(), vec!["2", "3", "4"]);
+    }
+
+    // ===================== Scrollback =====================
+
+    /// What the renderer would draw: the viewport read through `view_cell`, row by row.
+    fn view_lines(g: &Grid) -> Vec<String> {
+        (0..g.rows)
+            .map(|r| {
+                (0..g.cols)
+                    .map(|c| g.view_cell(c, r).ch)
+                    .filter(|&ch| ch != '\0')
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lines_scrolled_off_the_top_land_in_history() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"1\r\n2\r\n3\r\n4");
+        assert_eq!(g.to_lines(), vec!["3", "4"]);
+        assert_eq!(g.history_len(), 2); // "1" and "2"
+    }
+
+    #[test]
+    fn scrolling_back_shows_history_above_the_screen() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"1\r\n2\r\n3\r\n4");
+        assert_eq!(view_lines(&g), vec!["3", "4"]); // following the output
+
+        assert!(g.scroll_view(1));
+        assert_eq!(view_lines(&g), vec!["2", "3"]); // one history line, then the top screen row
+
+        assert!(g.scroll_view(1));
+        assert_eq!(view_lines(&g), vec!["1", "2"]); // both viewport rows come from history
+
+        assert!(!g.scroll_view(1)); // clamped at the oldest line: no change, no redraw
+        assert_eq!(view_lines(&g), vec!["1", "2"]);
+
+        assert!(g.scroll_to_bottom());
+        assert_eq!(view_lines(&g), vec!["3", "4"]);
+    }
+
+    #[test]
+    fn delete_lines_does_not_pollute_history() {
+        // Regression test: DL with the cursor on row 0 reaches scroll_up(0, bot, n), which is
+        // byte-for-byte the call linefeed makes when scrolling at the bottom. Those lines were
+        // deleted by the application, not scrolled off the top — they must never enter history.
+        let mut g = Grid::new(3, 3);
+        g.feed(b"1\r\n2\r\n3"); // fills the screen without ever scrolling
+        assert_eq!(g.history_len(), 0);
+        g.feed(b"\x1b[H"); // cursor home (row 0)
+        g.feed(b"\x1b[2M"); // DL 2: delete rows 0-1
+        assert_eq!(g.to_lines(), vec!["3", "", ""]);
+        assert_eq!(g.history_len(), 0, "DL'd lines must not enter the scrollback");
+    }
+
+    #[test]
+    fn scroll_region_scroll_does_not_enter_history() {
+        // A partial scroll region (top != 0) never spills off the top of the screen.
+        let mut g = Grid::new(3, 3);
+        g.feed(b"\x1b[2;3r"); // confine scrolling to rows 2-3
+        g.feed(b"\x1b[2;1H"); // park the cursor inside the region
+        g.feed(b"a\r\nb\r\nc");
+        assert_eq!(g.history_len(), 0);
+    }
+
+    #[test]
+    fn alt_screen_has_no_scrollback() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"1\r\n2\r\n3"); // one line ("1") into history
+        assert_eq!(g.history_len(), 1);
+
+        g.feed(b"\x1b[?1049h"); // enter alt screen
+        g.feed(b"a\r\nb\r\nc\r\nd"); // scrolls a lot, contributes nothing
+        assert_eq!(g.history_len(), 1);
+        assert!(!g.scroll_view(1), "the alt screen must not scroll back");
+        assert_eq!(g.view_offset(), 0);
+
+        g.feed(b"\x1b[?1049l"); // leave: the main screen and its history come back untouched
+        assert_eq!(g.history_len(), 1);
+        assert_eq!(g.to_lines(), vec!["2", "3"]);
+    }
+
+    #[test]
+    fn new_output_keeps_the_scrolled_back_viewport_pinned() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"1\r\n2\r\n3\r\n4");
+        g.scroll_view(2);
+        assert_eq!(view_lines(&g), vec!["1", "2"]);
+
+        g.feed(b"\r\n5"); // more output arrives while the user is reading back
+        assert_eq!(view_lines(&g), vec!["1", "2"], "the viewport must not jump");
+        assert_eq!(g.view_offset(), 3);
+
+        g.scroll_to_bottom();
+        assert_eq!(view_lines(&g), vec!["4", "5"]);
+    }
+
+    #[test]
+    fn history_is_capped_and_the_viewport_survives_eviction() {
+        let mut g = Grid::new(6, 2);
+        for i in 0..HISTORY_MAX + 10 {
+            g.feed(format!("{i}\r\n").as_bytes());
+        }
+        assert_eq!(g.history_len(), HISTORY_MAX);
+
+        // Scrolled fully back, the oldest surviving line is on top; further output evicts from the
+        // front, and the clamp keeps the offset legal rather than reading past the end.
+        g.scroll_view(HISTORY_MAX as isize);
+        assert_eq!(g.view_offset(), HISTORY_MAX);
+        g.feed(b"tail\r\n");
+        assert_eq!(g.view_offset(), HISTORY_MAX);
+        assert_eq!(g.history_len(), HISTORY_MAX);
+        let _ = view_lines(&g); // must not panic on the evicted front
+    }
+
+    #[test]
+    fn ed3_clears_the_scrollback() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"1\r\n2\r\n3\r\n4");
+        g.scroll_view(2);
+        g.feed(b"\x1b[3J");
+        assert_eq!(g.history_len(), 0);
+        assert_eq!(g.view_offset(), 0);
+    }
+
+    #[test]
+    fn resize_clamps_the_view_offset() {
+        let mut g = Grid::new(3, 2);
+        g.feed(b"1\r\n2\r\n3\r\n4");
+        g.scroll_view(2);
+        g.resize(5, 4);
+        assert!(g.view_offset() <= g.history_len());
+        let _ = view_lines(&g); // wider rows read blanks past each trimmed history row
     }
 
     #[test]

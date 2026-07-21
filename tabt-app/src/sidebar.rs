@@ -13,8 +13,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSBezierPath, NSColor, NSEvent, NSFont, NSGraphicsContext, NSImage, NSMenu, NSMenuItem,
-    NSRectClip, NSRectFill, NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSGraphicsContext, NSImage,
+    NSMenu, NSMenuItem, NSRectClip, NSRectFill, NSStringDrawing, NSTrackingArea,
+    NSTrackingAreaOptions, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -254,6 +255,14 @@ declare_class!(
         }
 
         // ---- Group/tab "⋯" menu-item handlers (tag holds the group index or tab id) ----
+        #[method(groupNewTab:)]
+        fn group_new_tab(&self, item: &NSMenuItem) {
+            let gi = unsafe { item.tag() } as usize;
+            if let Some(ctrl) = self.controller() {
+                ctrl.add_tab_in_group(gi);
+            }
+        }
+
         #[method(groupRename:)]
         fn group_rename(&self, item: &NSMenuItem) {
             let gi = unsafe { item.tag() } as usize;
@@ -400,7 +409,10 @@ impl SidebarView {
             .iter()
             .filter(|(_, t, _, _)| q.is_empty() || t.to_lowercase().contains(&q))
             .collect();
-        if !matched_ung.is_empty() {
+        // The "Sessions" section label is always shown (even with no ungrouped tabs), so the session
+        // list stays anchored and remains a visible drop target. During a search it's hidden only when
+        // no session matches, matching how empty groups drop out of the filtered list.
+        if q.is_empty() || !matched_ung.is_empty() {
             // "Sessions" section label above the tabs (matches the GROUP labels below).
             rows.push(Row { top: y - scroll, h: SECTION_H, indent: PAD, label: "Sessions".to_string(), kind: Press::TabsLabel, selected: false, collapsed: false, group: usize::MAX, dot: 0, locked: false });
             y += SECTION_H;
@@ -647,7 +659,6 @@ impl SidebarView {
         // Selection highlight is a theme-aligned neutral wash (adapts to light/dark), not a fixed accent.
         if row.selected {
             round_fill(inset, 7.0, &overlay(0.16));
-            round_stroke(inset, 7.0, 1.0, &overlay(0.24));
         } else if hovered {
             round_fill(inset, 7.0, &overlay(0.06));
         }
@@ -728,9 +739,12 @@ impl SidebarView {
     }
 
     /// Which "region" a row belongs to: None = ungrouped region, Some(gi) = a group; non-list rows return the outer None.
+    /// The "Sessions" label counts as part of the ungrouped region (just as a group title counts as part of its
+    /// group), so an empty session list is still a hit-testable drop target with a place to anchor the drop line.
     fn row_region(row: &Row) -> Option<Option<usize>> {
         match row.kind {
             Press::Group(gi) => Some(Some(gi)),
+            Press::TabsLabel => Some(None),
             Press::Tab(_, _) => Some(if row.group == UNGROUPED { None } else { Some(row.group) }),
             _ => None,
         }
@@ -860,6 +874,21 @@ impl SidebarView {
         Press::None
     }
 
+    /// Pop up the "more" menu of the group/tab row at `(x, y)`, anchored at that point.
+    /// Returns false when the point hits no group/tab row (nothing is shown).
+    fn open_menu_at(&self, snap: &Snapshot, x: f64, y: f64) -> bool {
+        let h = self.bounds().size.height;
+        let query = self.ivars().query.borrow().clone();
+        self.ivars().cur_x.set(x); // so the popup positions at this point
+        self.ivars().cur_y.set(y);
+        match self.row_at(snap, y, h, &query) {
+            Press::Group(gi) => self.open_group_menu(gi),
+            Press::Tab(id, _) => self.open_tab_menu(id),
+            _ => return false,
+        }
+        true
+    }
+
     /// Right-click: on a group/tab row, pop up the corresponding "more" menu (positioned at the mouse).
     fn on_right_down(&self, event: &NSEvent) {
         let snap = match self.controller() {
@@ -867,15 +896,66 @@ impl SidebarView {
             None => return,
         };
         let p = self.convertPoint_fromView(unsafe { event.locationInWindow() }, None);
-        let h = self.bounds().size.height;
-        let query = self.ivars().query.borrow().clone();
-        self.ivars().cur_x.set(p.x); // so popup positions at the mouse
-        self.ivars().cur_y.set(p.y);
-        match self.row_at(&snap, p.y, h, &query) {
-            Press::Group(gi) => self.open_group_menu(gi),
-            Press::Tab(id, _) => self.open_tab_menu(id),
-            _ => {}
+        self.open_menu_at(&snap, p.x, p.y);
+    }
+
+    /// ⌃↩: open a row's "more" menu from the keyboard. The row under the pointer wins (so hover +
+    /// shortcut reads as a right-click); with the pointer elsewhere it falls back to the active tab,
+    /// expanding its group and scrolling it into view so the menu — and any rename box it opens —
+    /// anchors somewhere visible rather than to a clipped coordinate.
+    pub fn open_context_menu(&self) {
+        let ctrl = match self.controller() {
+            Some(c) => c,
+            None => return,
+        };
+        let snap = ctrl.snapshot();
+        if self.ivars().hovering.get()
+            && self.open_menu_at(&snap, self.ivars().hover_x.get(), self.ivars().hover_y.get())
+        {
+            return;
         }
+        let active = match snap.active {
+            Some(a) => a,
+            None => return,
+        };
+        let query = self.ivars().query.borrow().clone();
+        // Outside search, a collapsed group hides its tabs entirely: expand it so the active row exists.
+        if query.is_empty() {
+            let holder = snap
+                .groups
+                .iter()
+                .position(|g| g.collapsed && g.tabs.iter().any(|(id, ..)| *id == active));
+            if let Some(gi) = holder {
+                ctrl.toggle_group_collapsed(gi);
+            }
+        }
+        let snap = ctrl.snapshot();
+        let rows = Self::build_rows(&snap, &query, 0.0);
+        let top = match rows.iter().find(|r| matches!(r.kind, Press::Tab(id, _) if id == active)) {
+            Some(r) => r.top,
+            None => return, // filtered out by the search query
+        };
+        // Scroll the row into the visible band, then anchor the menu to its bottom-left.
+        let h = self.bounds().size.height;
+        let (list_top, footer_top) = (Self::list_top(), h - Self::footer_height());
+        let mut s = self.scroll();
+        if top - s < list_top {
+            s = top - list_top;
+        }
+        if top - s + ROW_H > footer_top {
+            s = top + ROW_H - footer_top;
+        }
+        let s = s.clamp(0.0, Self::max_scroll_of(&rows, h));
+        self.ivars().scroll.set(s);
+        // Flush the scroll before popping the menu: popUpMenuPositioning… runs its own modal loop,
+        // so a merely-invalidated view would still show the pre-scroll rows underneath it.
+        unsafe {
+            self.setNeedsDisplay(true);
+            self.displayIfNeeded();
+        }
+        self.ivars().cur_x.set(PAD + 30.0);
+        self.ivars().cur_y.set(top - s + ROW_H);
+        self.open_tab_menu(active);
     }
 
     /// Scroll the list to the bottom (called after creating a group, so the new group at the end is visible).
@@ -993,16 +1073,27 @@ impl SidebarView {
                 }
                 Press::Tab(id, _) => {
                     self.exit_search();
-                    // Double-click → rename in place; single click → select.
+                    // Double-click → rename in place; single click → select, or deselect when it is
+                    // already the active tab (the terminal area falls back to the placeholder).
                     if unsafe { event.clickCount() } >= 2 {
                         self.start_edit(Editing::Tab(id));
                     } else {
-                        ctrl.select(id);
+                        ctrl.toggle_select(id);
                     }
                 }
                 Press::Group(gi) => {
-                    // Single-click a group title → collapse/expand (rename etc. go through the "⋯" menu).
-                    ctrl.toggle_group_collapsed(gi);
+                    // Single-click a group title → collapse/expand; double-click → rename in place.
+                    // AppKit still delivers the double-click's first press as clickCount 1, so that
+                    // press already toggled the group; undo it here so a double-click only renames.
+                    let clicks = unsafe { event.clickCount() };
+                    if clicks >= 2 {
+                        if clicks == 2 {
+                            ctrl.toggle_group_collapsed(gi);
+                        }
+                        self.start_edit(Editing::Group(gi));
+                    } else {
+                        ctrl.toggle_group_collapsed(gi);
+                    }
                 }
                 Press::GroupMenu(gi) => self.open_group_menu(gi),
                 Press::TabMenu(id) => self.open_tab_menu(id),
@@ -1141,6 +1232,8 @@ impl SidebarView {
             .and_then(|s| s.groups.get(gi).map(|g| g.collapsed))
             .unwrap_or(false);
         let menu = NSMenu::new(mtm);
+        menu.addItem(&self.menu_item("New Terminal", sel!(groupNewTab:), gi as isize));
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&self.menu_item("Rename", sel!(groupRename:), gi as isize));
         let toggle = if collapsed { "Expand" } else { "Collapse" };
         menu.addItem(&self.menu_item(toggle, sel!(groupToggle:), gi as isize));
@@ -1259,6 +1352,10 @@ impl SidebarView {
     /// Keyboard input: rename takes priority, then search. Both only trigger when the sidebar is focused.
     fn on_key(&self, event: &NSEvent) {
         let code = unsafe { event.keyCode() };
+        // ⌘ held: ⌘⌫ deletes to the start of the line; every other ⌘-combo is swallowed rather than
+        // typed, so ⌘A/⌘V (whose menu items don't apply to the sidebar, hence reach keyDown) don't
+        // insert a bare "a"/"v" into the buffer.
+        let cmd = unsafe { event.modifierFlags() }.contains(NSEventModifierFlags::NSEventModifierFlagCommand);
         // ---- Rename state ----
         if self.ivars().editing.get().is_some() {
             match code {
@@ -1268,7 +1365,9 @@ impl SidebarView {
                 124 => self.caret_right(&self.ivars().edit_buf), // →
                 115 => self.caret_home(),         // Home
                 119 => self.caret_end(&self.ivars().edit_buf),   // End
+                51 if cmd => self.caret_delete_to_start(&self.ivars().edit_buf), // ⌘⌫
                 51 => self.caret_backspace(&self.ivars().edit_buf), // Backspace
+                _ if cmd => {}
                 _ => self.caret_insert(&self.ivars().edit_buf, event),
             }
             unsafe { self.setNeedsDisplay(true) };
@@ -1285,7 +1384,9 @@ impl SidebarView {
             124 => self.caret_right(&self.ivars().query), // →
             115 => self.caret_home(),             // Home
             119 => self.caret_end(&self.ivars().query), // End
+            51 if cmd => self.caret_delete_to_start(&self.ivars().query), // ⌘⌫
             51 => self.caret_backspace(&self.ivars().query), // Backspace
+            _ if cmd => {}
             _ => self.caret_insert(&self.ivars().query, event),
         }
         unsafe { self.setNeedsDisplay(true) };
@@ -1330,6 +1431,18 @@ impl SidebarView {
         let end = Self::char_byte(&s, c);
         s.replace_range(start..end, "");
         self.ivars().caret.set(c - 1);
+    }
+
+    /// ⌘⌫: delete from the start of the line up to the caret (text after the caret survives).
+    fn caret_delete_to_start(&self, buf: &RefCell<String>) {
+        let c = self.ivars().caret.get();
+        if c == 0 {
+            return;
+        }
+        let mut s = buf.borrow_mut();
+        let end = Self::char_byte(&s, c);
+        s.replace_range(..end, "");
+        self.ivars().caret.set(0);
     }
 
     /// Insert the event's typable characters at the caret.

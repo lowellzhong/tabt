@@ -12,7 +12,11 @@ use std::os::unix::io::RawFd;
 use std::rc::Rc;
 
 use objc2::rc::Retained;
-use objc2_app_kit::{NSAlert, NSApplication, NSAutoresizingMaskOptions, NSView, NSWindow, NSWindowButton};
+use objc2::msg_send;
+use objc2_app_kit::{
+    NSAlert, NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    NSAutoresizingMaskOptions, NSView, NSWindow, NSWindowButton,
+};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
 use crate::config;
@@ -25,7 +29,7 @@ use crate::settings_dialog::SettingsDialog;
 use crate::sidebar::{SidebarView, SIDEBAR_W};
 use crate::theme;
 use crate::toggle::{ToggleButton, TOGGLE_W};
-use crate::view::{self, TermView};
+use crate::view::{self, ns_color, TermView};
 
 struct Tab {
     id: u64,
@@ -202,6 +206,32 @@ impl AppController {
         }
     }
 
+    /// Keep the AppKit-drawn window chrome in step with the theme.
+    ///
+    /// Two things here are drawn by AppKit, not by us, and both default to the *system* appearance
+    /// — which is wrong whenever the theme's lightness disagrees with it (the usual case: a dark
+    /// theme under a light system appearance).
+    ///
+    /// 1. The backdrop. Nothing normally shows it: the sidebar and the terminal host tile the whole
+    ///    content view. But their seam lands wherever the sidebar width puts it, which is rarely a
+    ///    whole device pixel, so both views antialias their edge against the backdrop and let a
+    ///    fraction of it through as a hairline — a bright `windowBackgroundColor` line at the
+    ///    default. Painting it with the theme background blends it away.
+    /// 2. The window frame, which strokes a light highlight along its top edge. There is no API to
+    ///    suppress that stroke; matching the window's appearance to the theme makes it dark instead.
+    ///
+    /// (Same reason the header/placeholder track the theme, and the settings dialog pins its own.)
+    fn sync_window_chrome(&self) {
+        let t = theme::current();
+        self.window.setBackgroundColor(Some(&ns_color(t.bg)));
+        let name = unsafe {
+            if t.is_dark() { NSAppearanceNameDarkAqua } else { NSAppearanceNameAqua }
+        };
+        if let Some(ap) = NSAppearance::appearanceNamed(name) {
+            let _: () = unsafe { msg_send![&*self.window, setAppearance: &*ap] };
+        }
+    }
+
     /// Re-lay out the sidebar, divider, and terminal host per the current width / side / collapsed state,
     /// and set the autoresizing mask (on window resize: the sidebar keeps a fixed width against the edge, host fills the rest).
     fn relayout(&self) {
@@ -292,6 +322,7 @@ impl AppController {
         let idx = theme::index_of(&layout.style);
         self.style.set(idx);
         theme::set(theme::by_index(idx));
+        self.sync_window_chrome();
         settings::set(&layout.font_family, layout.font_size);
         // The sidebar width/position must be set before spawning tabs and computing host dimensions.
         self.sidebar_w.set(layout.sidebar_w.clamp(190.0, 480.0));
@@ -948,6 +979,7 @@ impl AppController {
         }
         self.style.set(idx);
         theme::set(theme::by_index(idx));
+        self.sync_window_chrome();
         // Only the active tab is present; the other tabs will be redrawn with the new theme the next time they are switched to.
         if let Some(a) = self.model.borrow().active {
             if let Some(tab) = self.model.borrow().tabs.iter().find(|t| t.id == a) {
@@ -1108,6 +1140,8 @@ impl AppController {
 
     /// Collapse/expand the sidebar (⌘B). When collapsed, the terminal fills the entire content area.
     pub fn toggle_sidebar(&self) {
+        // Collapsing must not leave an invisible search/rename box holding the keyboard.
+        self.sidebar.end_input();
         self.collapsed.set(!self.collapsed.get());
         self.relayout();
         self.update_title();

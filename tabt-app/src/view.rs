@@ -19,7 +19,7 @@ use objc2_app_kit::{
     NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSFontWeightRegular,
     NSForegroundColorAttributeName, NSImage, NSImageSymbolConfiguration, NSImageSymbolScale,
     NSLineBreakMode, NSMutableParagraphStyle, NSParagraphStyleAttributeName, NSPasteboard,
-    NSPasteboardTypeString, NSRectFill, NSStringDrawing, NSTextInputClient, NSView,
+    NSPasteboardTypeString, NSRectFill, NSResponder, NSStringDrawing, NSTextInputClient, NSView,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSInteger,
@@ -197,6 +197,7 @@ declare_class!(
         // ---- Mouse selection ----
         #[method(mouseDown:)]
         fn mouse_down(&self, event: &NSEvent) {
+            self.take_focus();
             let c = self.cell_at(event);
             self.ivars().sel_anchor.set(Some(c));
             self.ivars().sel_head.set(Some(c));
@@ -585,6 +586,24 @@ impl TermView {
         unsafe {
             libc::ioctl(ivars.master_fd.get(), libc::TIOCSWINSZ, &ws);
             self.setNeedsDisplay(true);
+        }
+    }
+
+    /// Click-to-focus: AppKit doesn't hand first-responder status to a plain view on click, so a
+    /// click here has to claim the keyboard back from the sidebar — that is what ends a sidebar
+    /// search/rename (see `resignFirstResponder` there). Skipped when already focused, because
+    /// `makeFirstResponder` relays out the titlebar (see the traffic-light note in `app.rs`).
+    fn take_focus(&self) {
+        let window = match self.window() {
+            Some(w) => w,
+            None => return,
+        };
+        let me: *const AnyObject = self as *const Self as *const AnyObject;
+        let focused = window
+            .firstResponder()
+            .map_or(false, |r| (&*r as *const NSResponder as *const AnyObject) == me);
+        if !focused {
+            window.makeFirstResponder(Some(self));
         }
     }
 

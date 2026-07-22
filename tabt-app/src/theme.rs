@@ -20,9 +20,13 @@ pub struct Theme {
 impl Theme {
     /// Sidebar background: tracks the theme so it stays coherent when the theme changes.
     /// Nudged very slightly off the body background to hint a panel edge on both dark and light themes.
+    pub fn is_dark(&self) -> bool {
+        luminance(self.bg) <= 0.5
+    }
+
     pub fn sidebar_bg(&self) -> Rgb {
         // Dark themes: a touch lighter; light themes: a touch darker.
-        let d = if luminance(self.bg) > 0.5 { -0.02 } else { 0.02 };
+        let d = if self.is_dark() { 0.02 } else { -0.02 };
         (
             (self.bg.0 + d).clamp(0.0, 1.0),
             (self.bg.1 + d).clamp(0.0, 1.0),

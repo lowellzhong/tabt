@@ -4,8 +4,9 @@
 //!   - two buttons at the top: "＋ New Terminal" and "＋ New Group";
 //!   - each group has one title row, with its tabs listed indented below; click a tab to switch,
 //!     drag a tab to another group to move it.
-//! All actions are forwarded to [`AppController`](crate::app::AppController). The view is never
-//! the first responder (acceptsFirstResponder defaults to false); keyboard focus always stays on the terminal.
+//! All actions are forwarded to [`AppController`](crate::app::AppController). The view only takes
+//! keyboard focus while its search box or an in-place rename box is active (see `acceptsFirstResponder`);
+//! the rest of the time focus stays on the terminal, and a click outside the box hands it straight back.
 
 use std::cell::{Cell, RefCell};
 
@@ -14,8 +15,8 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSGraphicsContext, NSImage,
-    NSMenu, NSMenuItem, NSRectClip, NSRectFill, NSStringDrawing, NSTrackingArea,
-    NSTrackingAreaOptions, NSView,
+    NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSRectClip, NSRectFill,
+    NSStringDrawing, NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -37,6 +38,8 @@ const FROW_H: f64 = 32.0; // bottom settings row (same height as session rows)
 const FPAD: f64 = 8.0; // settings row top/bottom margin (symmetric)
 /// `group` sentinel for ungrouped tab rows (distinct from the button's usize::MAX).
 const UNGROUPED: usize = usize::MAX - 1;
+/// How many ⌘Z steps the search/rename boxes keep (they hold one short line, so this is plenty).
+const UNDO_DEPTH: usize = 64;
 
 const DOT_RUNNING: (f64, f64, f64) = (52.0 / 255.0, 199.0 / 255.0, 89.0 / 255.0); // #34c759
 
@@ -133,8 +136,25 @@ pub struct SidebarIvars {
     edit_buf: RefCell<String>,
     // Text caret position (char index) for the active input (search query or rename buffer).
     caret: Cell<usize>,
+    // Selection anchor (char index) of the active input: the selection spans anchor..caret.
+    // None means no selection; the anchor is dropped as soon as the selection collapses.
+    sel: Cell<Option<usize>>,
+    // ⌘Z/⇧⌘Z history for the active input: (text, caret) snapshots taken before each mutation.
+    undo: RefCell<Vec<(String, usize)>>,
+    redo: RefCell<Vec<(String, usize)>>,
+    // Kind of the previous mutation, so a run of typing (or of deleting) collapses into one undo step.
+    last_edit: Cell<EditKind>,
     // Tab id the color-picker menu currently applies to (set when the menu opens).
     dot_target: Cell<u64>,
+}
+
+/// What the last text mutation was, used to coalesce undo steps: consecutive mutations of the same
+/// kind share one snapshot, so ⌘Z undoes a whole typed word rather than one character.
+#[derive(Clone, Copy, PartialEq)]
+enum EditKind {
+    None,
+    Insert,
+    Delete,
 }
 
 /// The object being renamed in place.
@@ -245,6 +265,8 @@ declare_class!(
             self.ivars().searching.set(false);
             self.ivars().query.borrow_mut().clear();
             self.ivars().editing.set(None);
+            self.ivars().edit_buf.borrow_mut().clear();
+            self.reset_input();
             unsafe { self.setNeedsDisplay(true) };
             true
         }
@@ -351,6 +373,10 @@ impl SidebarView {
             editing: Cell::new(None),
             edit_buf: RefCell::new(String::new()),
             caret: Cell::new(0),
+            sel: Cell::new(None),
+            undo: RefCell::new(Vec::new()),
+            redo: RefCell::new(Vec::new()),
+            last_edit: Cell::new(EditKind::None),
             dot_target: Cell::new(0),
         });
         unsafe { msg_send_id![super(this), initWithFrame: frame] }
@@ -980,6 +1006,25 @@ impl SidebarView {
         let (w, h) = (self.bounds().size.width, self.bounds().size.height);
         let query = self.ivars().query.borrow().clone();
         let mut press = self.row_at(&snap, y, h, &query);
+        // A press outside the focused input leaves it: the rename is abandoned, the search box drops
+        // back to its resting look. A press inside the box is swallowed so the input keeps focus.
+        // Both tests use the raw row hit, before the "⋯"/dot sub-areas below are split out of it.
+        if let Some(what) = self.ivars().editing.get() {
+            // The rename box covers its whole row, so any press on that row lands inside the box.
+            let on_edit_row = match (what, press) {
+                (Editing::Tab(a), Press::Tab(b, _)) => a == b,
+                (Editing::Group(a), Press::Group(b)) => a == b,
+                _ => false,
+            };
+            if on_edit_row {
+                self.ivars().press.set(Press::None);
+                self.ivars().dragging.set(false);
+                return;
+            }
+            self.cancel_rename();
+        } else if self.ivars().searching.get() && press != Press::Search {
+            self.exit_search();
+        }
         // Dual-button row: by x, land on "Terminal" (left) or "Group" (right).
         if press == Press::Actions {
             let gap = 8.0;
@@ -1142,6 +1187,9 @@ impl SidebarView {
             unsafe { c.saveGraphicsState() };
         }
         unsafe { NSRectClip(clip) };
+        if searching {
+            self.draw_selection(query, text_x, offset, row.top + 4.0, row.h - 9.0);
+        }
         unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(text_x - offset, row.top + (row.h - 16.0) / 2.0), Some(&attrs)) };
         // Cursor: when focused, sits at the caret position within the query (hugs the left for an empty query).
         if searching {
@@ -1181,6 +1229,7 @@ impl SidebarView {
             unsafe { c.saveGraphicsState() };
         }
         unsafe { NSRectClip(clip) };
+        self.draw_selection(&text, text_x, offset, row.top + (row.h - 15.0) / 2.0, 15.0);
         unsafe { ns.drawAtPoint_withAttributes(NSPoint::new(text_x - offset, row.top + (row.h - 16.0) / 2.0), Some(&attrs)) };
         // Cursor at the caret (shifted by the same scroll offset).
         unsafe {
@@ -1194,13 +1243,33 @@ impl SidebarView {
 
     /// Glyph width of the substring before the caret, for cursor positioning (uses the sidebar font).
     fn caret_width(&self, text: &str) -> f64 {
-        let upto = &text[..Self::char_byte(text, self.ivars().caret.get())];
+        self.text_width(text, self.ivars().caret.get())
+    }
+
+    /// Glyph width of the first `chars` characters (sidebar font).
+    fn text_width(&self, text: &str, chars: usize) -> f64 {
+        let upto = &text[..Self::char_byte(text, chars)];
         if upto.is_empty() {
             return 0.0;
         }
         let attrs = make_attrs(&self.ivars().font, None);
         let ns = NSString::from_str(upto);
         unsafe { ns.sizeWithAttributes(Some(&attrs)).width }
+    }
+
+    /// Selection highlight behind the text of an input box, drawn inside its clipped region.
+    /// `text_x`/`offset` are the box's text origin and horizontal scroll, as used for the caret.
+    fn draw_selection(&self, text: &str, text_x: f64, offset: f64, top: f64, h: f64) {
+        let (a, b) = match self.selection() {
+            Some(r) => r,
+            None => return,
+        };
+        let xa = text_x + self.text_width(text, a) - offset + 1.0;
+        let xb = text_x + self.text_width(text, b) - offset + 1.0;
+        unsafe {
+            rgba(ACCENT_ICON.0, ACCENT_ICON.1, ACCENT_ICON.2, 0.30).set();
+            NSRectFill(rect(xa, top, xb - xa, h));
+        }
     }
 
     /// Build a menu item: title + action targeting this view + tag (holds the group index or tab id).
@@ -1328,8 +1397,13 @@ impl SidebarView {
     }
 
     fn enter_search(&self) {
+        // Clicking the box again while it is already focused must not reset the caret and undo history.
+        if self.ivars().searching.get() {
+            return;
+        }
         self.ivars().searching.set(true);
         self.ivars().caret.set(self.ivars().query.borrow().chars().count());
+        self.reset_input();
         if let Some(ctrl) = self.controller() {
             ctrl.focus_sidebar();
         }
@@ -1344,52 +1418,104 @@ impl SidebarView {
     fn exit_search(&self) {
         self.ivars().searching.set(false);
         self.ivars().query.borrow_mut().clear();
+        self.reset_input();
         if let Some(ctrl) = self.controller() {
             ctrl.focus_terminal();
         }
     }
 
-    /// Keyboard input: rename takes priority, then search. Both only trigger when the sidebar is focused.
+    /// The buffer the keyboard is editing: the rename box takes priority over the search box.
+    fn active_buf(&self) -> Option<&RefCell<String>> {
+        if self.ivars().editing.get().is_some() {
+            Some(&self.ivars().edit_buf)
+        } else if self.ivars().searching.get() {
+            Some(&self.ivars().query)
+        } else {
+            None
+        }
+    }
+
+    /// Keyboard input: only Esc/Return differ between the rename and search boxes; everything else
+    /// is the shared single-line text editing below. Both only trigger when the sidebar is focused.
     fn on_key(&self, event: &NSEvent) {
         let code = unsafe { event.keyCode() };
-        // ⌘ held: ⌘⌫ deletes to the start of the line; every other ⌘-combo is swallowed rather than
-        // typed, so ⌘A/⌘V (whose menu items don't apply to the sidebar, hence reach keyDown) don't
-        // insert a bare "a"/"v" into the buffer.
-        let cmd = unsafe { event.modifierFlags() }.contains(NSEventModifierFlags::NSEventModifierFlagCommand);
-        // ---- Rename state ----
-        if self.ivars().editing.get().is_some() {
-            match code {
-                53 => self.cancel_rename(),      // Esc
-                36 | 76 => self.commit_rename(),  // Return / Enter
-                123 => self.caret_left(),         // ←
-                124 => self.caret_right(&self.ivars().edit_buf), // →
-                115 => self.caret_home(),         // Home
-                119 => self.caret_end(&self.ivars().edit_buf),   // End
-                51 if cmd => self.caret_delete_to_start(&self.ivars().edit_buf), // ⌘⌫
-                51 => self.caret_backspace(&self.ivars().edit_buf), // Backspace
-                _ if cmd => {}
-                _ => self.caret_insert(&self.ivars().edit_buf, event),
-            }
-            unsafe { self.setNeedsDisplay(true) };
-            return;
-        }
-        // ---- Search state ----
-        if !self.ivars().searching.get() {
-            return;
-        }
+        let editing = self.ivars().editing.get().is_some();
+        let buf = match self.active_buf() {
+            Some(b) => b,
+            None => return,
+        };
         match code {
-            53 => self.exit_search(),             // Esc
-            36 | 76 => self.select_first_match(), // Return / Enter
-            123 => self.caret_left(),             // ←
-            124 => self.caret_right(&self.ivars().query), // →
-            115 => self.caret_home(),             // Home
-            119 => self.caret_end(&self.ivars().query), // End
-            51 if cmd => self.caret_delete_to_start(&self.ivars().query), // ⌘⌫
-            51 => self.caret_backspace(&self.ivars().query), // Backspace
-            _ if cmd => {}
-            _ => self.caret_insert(&self.ivars().query, event),
+            53 if editing => self.cancel_rename(),        // Esc
+            53 => self.exit_search(),
+            36 | 76 if editing => self.commit_rename(),   // Return / Enter
+            36 | 76 => self.select_first_match(),
+            _ => self.text_key(buf, event, code),
         }
         unsafe { self.setNeedsDisplay(true) };
+    }
+
+    /// The standard single-line text-field keys, shared by the search and rename boxes:
+    /// ⌘A/⌘C/⌘X/⌘V/⌘Z/⇧⌘Z, caret movement by character (arrows), word (⌥) and line (⌘ / Home / End /
+    /// ⌃A / ⌃E), all extending the selection when ⇧ is held, plus the matching deletions.
+    /// Any other ⌘-combo is swallowed rather than typed, so e.g. ⌘T doesn't insert a bare "t".
+    fn text_key(&self, buf: &RefCell<String>, event: &NSEvent, code: u16) {
+        let flags = unsafe { event.modifierFlags() };
+        let cmd = flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand);
+        let shift = flags.contains(NSEventModifierFlags::NSEventModifierFlagShift);
+        let alt = flags.contains(NSEventModifierFlags::NSEventModifierFlagOption);
+        let ctrl = flags.contains(NSEventModifierFlags::NSEventModifierFlagControl);
+        let text = buf.borrow().clone();
+        let caret = self.ivars().caret.get();
+        let end = text.chars().count();
+        match code {
+            // ---- Clipboard / undo ----
+            0 if cmd => self.select_all(&text),                     // ⌘A
+            8 if cmd => self.copy_selection(&text),                 // ⌘C
+            7 if cmd => {                                           // ⌘X
+                self.copy_selection(&text);
+                self.delete_selection(buf, EditKind::None);
+            }
+            9 if cmd => self.paste_clipboard(buf),                  // ⌘V
+            6 if cmd && shift => self.undo_redo(buf, false),        // ⇧⌘Z
+            6 if cmd => self.undo_redo(buf, true),                  // ⌘Z
+            // ---- Caret movement (⇧ extends the selection) ----
+            123 if cmd || ctrl => self.move_caret(0, shift),        // ⌘← / ⌃←
+            124 if cmd || ctrl => self.move_caret(end, shift),      // ⌘→ / ⌃→
+            123 if alt => self.move_caret(word_left(&text, caret), shift),   // ⌥←
+            124 if alt => self.move_caret(word_right(&text, caret), shift),  // ⌥→
+            123 => match self.selection() {                         // ←
+                Some((a, _)) if !shift => self.move_caret(a, false),
+                _ => self.move_caret(caret.saturating_sub(1), shift),
+            },
+            124 => match self.selection() {                         // →
+                Some((_, b)) if !shift => self.move_caret(b, false),
+                _ => self.move_caret((caret + 1).min(end), shift),
+            },
+            115 => self.move_caret(0, shift),                       // Home
+            119 => self.move_caret(end, shift),                     // End
+            0 if ctrl => self.move_caret(0, shift),                 // ⌃A
+            14 if ctrl => self.move_caret(end, shift),              // ⌃E
+            // ---- Deletion ----
+            51 if cmd => self.splice(buf, 0, caret, "", EditKind::None), // ⌘⌫: to the line start
+            51 if alt => {                                          // ⌥⌫: the word before the caret
+                if !self.delete_selection(buf, EditKind::Delete) {
+                    self.splice(buf, word_left(&text, caret), caret, "", EditKind::None);
+                }
+            }
+            40 if ctrl => self.splice(buf, caret, end, "", EditKind::None), // ⌃K: to the line end
+            51 => {                                                 // ⌫
+                if !self.delete_selection(buf, EditKind::Delete) {
+                    self.splice(buf, caret.saturating_sub(1), caret, "", EditKind::Delete);
+                }
+            }
+            117 => {                                                // ⌦ (forward delete)
+                if !self.delete_selection(buf, EditKind::Delete) {
+                    self.splice(buf, caret, (caret + 1).min(end), "", EditKind::Delete);
+                }
+            }
+            _ if cmd => {}
+            _ => self.caret_insert(buf, event),
+        }
     }
 
     /// Byte offset of char index `i` into `s` (clamped to the string end).
@@ -1397,71 +1523,150 @@ impl SidebarView {
         s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len())
     }
 
-    fn caret_left(&self) {
+    /// The current selection as a char range, or None when it is empty.
+    fn selection(&self) -> Option<(usize, usize)> {
         let c = self.ivars().caret.get();
-        if c > 0 {
-            self.ivars().caret.set(c - 1);
+        self.ivars().sel.get().filter(|a| *a != c).map(|a| (a.min(c), a.max(c)))
+    }
+
+    /// Move the caret, either extending the selection (⇧ held) or dropping it.
+    fn move_caret(&self, to: usize, extend: bool) {
+        if extend {
+            if self.ivars().sel.get().is_none() {
+                self.ivars().sel.set(Some(self.ivars().caret.get()));
+            }
+        } else {
+            self.ivars().sel.set(None);
         }
-    }
-
-    fn caret_right(&self, buf: &RefCell<String>) {
-        let n = buf.borrow().chars().count();
-        let c = self.ivars().caret.get();
-        if c < n {
-            self.ivars().caret.set(c + 1);
+        self.ivars().caret.set(to);
+        // A selection that has collapsed back onto the caret is no selection at all.
+        if self.ivars().sel.get() == Some(to) {
+            self.ivars().sel.set(None);
         }
+        self.ivars().last_edit.set(EditKind::None);
     }
 
-    fn caret_home(&self) {
-        self.ivars().caret.set(0);
+    fn select_all(&self, text: &str) {
+        self.ivars().sel.set(Some(0));
+        self.ivars().caret.set(text.chars().count());
+        self.ivars().last_edit.set(EditKind::None);
     }
 
-    fn caret_end(&self, buf: &RefCell<String>) {
-        self.ivars().caret.set(buf.borrow().chars().count());
-    }
-
-    /// Delete the char before the caret.
-    fn caret_backspace(&self, buf: &RefCell<String>) {
-        let c = self.ivars().caret.get();
-        if c == 0 {
+    /// Replace the char range [a,b) with `text` and put the caret after the inserted text.
+    /// `kind` drives undo coalescing: a run of same-kind edits shares one undo step,
+    /// `EditKind::None` always starts a new one.
+    fn splice(&self, buf: &RefCell<String>, a: usize, b: usize, text: &str, kind: EditKind) {
+        if a >= b && text.is_empty() {
             return;
         }
+        self.push_undo(buf, kind);
         let mut s = buf.borrow_mut();
-        let start = Self::char_byte(&s, c - 1);
-        let end = Self::char_byte(&s, c);
-        s.replace_range(start..end, "");
-        self.ivars().caret.set(c - 1);
+        let (from, to) = (Self::char_byte(&s, a), Self::char_byte(&s, b));
+        s.replace_range(from..to, text);
+        drop(s);
+        self.ivars().caret.set(a + text.chars().count());
+        self.ivars().sel.set(None);
     }
 
-    /// ⌘⌫: delete from the start of the line up to the caret (text after the caret survives).
-    fn caret_delete_to_start(&self, buf: &RefCell<String>) {
-        let c = self.ivars().caret.get();
-        if c == 0 {
+    /// Delete the selection if there is one, reporting whether anything was deleted.
+    fn delete_selection(&self, buf: &RefCell<String>, kind: EditKind) -> bool {
+        match self.selection() {
+            Some((a, b)) => {
+                self.splice(buf, a, b, "", kind);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record the pre-edit state for ⌘Z. Consecutive edits of the same kind (a typed run, a run of
+    /// backspaces) reuse the step already on the stack so one ⌘Z undoes the whole run.
+    fn push_undo(&self, buf: &RefCell<String>, kind: EditKind) {
+        self.ivars().redo.borrow_mut().clear();
+        if kind == EditKind::None || self.ivars().last_edit.get() != kind {
+            let mut undo = self.ivars().undo.borrow_mut();
+            undo.push((buf.borrow().clone(), self.ivars().caret.get()));
+            if undo.len() > UNDO_DEPTH {
+                undo.remove(0);
+            }
+        }
+        self.ivars().last_edit.set(kind);
+    }
+
+    /// ⌘Z / ⇧⌘Z: swap the buffer with the top of the undo (or redo) stack.
+    fn undo_redo(&self, buf: &RefCell<String>, undo: bool) {
+        let (from, to) = if undo {
+            (&self.ivars().undo, &self.ivars().redo)
+        } else {
+            (&self.ivars().redo, &self.ivars().undo)
+        };
+        let (text, caret) = match from.borrow_mut().pop() {
+            Some(s) => s,
+            None => return,
+        };
+        to.borrow_mut().push((buf.borrow().clone(), self.ivars().caret.get()));
+        let n = text.chars().count();
+        *buf.borrow_mut() = text;
+        self.ivars().caret.set(caret.min(n));
+        self.ivars().sel.set(None);
+        self.ivars().last_edit.set(EditKind::None);
+    }
+
+    /// ⌘C / ⌘X: put the selected text on the general pasteboard (a no-op without a selection).
+    fn copy_selection(&self, text: &str) {
+        let (a, b) = match self.selection() {
+            Some(r) => r,
+            None => return,
+        };
+        let part = &text[Self::char_byte(text, a)..Self::char_byte(text, b)];
+        let pb = unsafe { NSPasteboard::generalPasteboard() };
+        unsafe {
+            pb.clearContents();
+            pb.setString_forType(&NSString::from_str(part), NSPasteboardTypeString);
+        }
+    }
+
+    /// ⌘V: insert the pasteboard text over the selection. These are single-line fields (and tab
+    /// names are stored in a line-based config), so control characters are dropped.
+    fn paste_clipboard(&self, buf: &RefCell<String>) {
+        let s = match unsafe { NSPasteboard::generalPasteboard().stringForType(NSPasteboardTypeString) } {
+            Some(s) => s.to_string(),
+            None => return,
+        };
+        let text: String = s.chars().filter(|c| is_typable(*c)).collect();
+        if text.is_empty() {
             return;
         }
-        let mut s = buf.borrow_mut();
-        let end = Self::char_byte(&s, c);
-        s.replace_range(..end, "");
-        self.ivars().caret.set(0);
+        let (a, b) = self.selection().unwrap_or_else(|| {
+            let c = self.ivars().caret.get();
+            (c, c)
+        });
+        self.splice(buf, a, b, &text, EditKind::None);
     }
 
-    /// Insert the event's typable characters at the caret.
+    /// Insert the event's typable characters, replacing the selection.
     fn caret_insert(&self, buf: &RefCell<String>, event: &NSEvent) {
         let s = match unsafe { event.characters() } {
             Some(s) => s.to_string(),
             None => return,
         };
-        for ch in s.chars() {
-            if !is_typable(ch) {
-                continue;
-            }
-            let c = self.ivars().caret.get();
-            let mut b = buf.borrow_mut();
-            let at = Self::char_byte(&b, c);
-            b.insert(at, ch);
-            drop(b);
-            self.ivars().caret.set(c + 1);
+        let text: String = s.chars().filter(|c| is_typable(*c)).collect();
+        if text.is_empty() {
+            return;
         }
+        let (a, b) = self.selection().unwrap_or_else(|| {
+            let c = self.ivars().caret.get();
+            (c, c)
+        });
+        self.splice(buf, a, b, &text, EditKind::Insert);
+    }
+
+    /// Reset the shared input state (selection + undo history) when a box takes or loses focus.
+    fn reset_input(&self) {
+        self.ivars().sel.set(None);
+        self.ivars().undo.borrow_mut().clear();
+        self.ivars().redo.borrow_mut().clear();
+        self.ivars().last_edit.set(EditKind::None);
     }
 
     fn select_first_match(&self) {
@@ -1503,6 +1708,7 @@ impl SidebarView {
         self.ivars().editing.set(Some(what));
         self.ivars().caret.set(init.chars().count()); // caret at end of the initial name
         *self.ivars().edit_buf.borrow_mut() = init;
+        self.reset_input();
         ctrl.focus_sidebar();
         unsafe { self.setNeedsDisplay(true) };
     }
@@ -1520,14 +1726,54 @@ impl SidebarView {
         self.cancel_rename();
     }
 
+    /// Leave whichever input box is focused, on an event from outside the sidebar (e.g. it is being
+    /// collapsed — an input the user can't see must not keep the keyboard). A no-op when neither box
+    /// is active, so it never steals focus from the terminal.
+    pub fn end_input(&self) {
+        if self.ivars().editing.get().is_some() {
+            self.cancel_rename();
+        } else if self.ivars().searching.get() {
+            self.exit_search();
+            unsafe { self.setNeedsDisplay(true) };
+        }
+    }
+
     fn cancel_rename(&self) {
         self.ivars().editing.set(None);
         self.ivars().edit_buf.borrow_mut().clear();
+        self.reset_input();
         if let Some(ctrl) = self.controller() {
             ctrl.focus_terminal();
         }
         unsafe { self.setNeedsDisplay(true) };
     }
+}
+
+/// Char index of the word boundary before `at`: skip the separators immediately left of the caret,
+/// then the word itself (⌥← and ⌥⌫).
+fn word_left(text: &str, at: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = at.min(chars.len());
+    while i > 0 && !chars[i - 1].is_alphanumeric() {
+        i -= 1;
+    }
+    while i > 0 && chars[i - 1].is_alphanumeric() {
+        i -= 1;
+    }
+    i
+}
+
+/// Char index of the word boundary after `at` (⌥→), mirroring `word_left`.
+fn word_right(text: &str, at: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = at.min(chars.len());
+    while i < chars.len() && !chars[i].is_alphanumeric() {
+        i += 1;
+    }
+    while i < chars.len() && chars[i].is_alphanumeric() {
+        i += 1;
+    }
+    i
 }
 
 /// Whether a character is typable text: excludes control characters and AppKit
